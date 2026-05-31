@@ -1,0 +1,15 @@
+# IMPORTANT: Install PyTorch BEFORE this file using:
+#   pip install torch==2.5.1+cpu torchvision==0.20.1+cpu --index-url https://download.pytorch.org/whl/cpu
+# Then run:
+#   pip install -r requirements-pipeline.txt
+
+ultralytics==8.3.50
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+shapely==2.0.6
+scipy==1.14.1
+httpx==0.28.1
+python-dotenv==1.0.1
+pydantic==2.10.3
+pandas==2.2.3
+tqdm==4.67.1

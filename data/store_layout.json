@@ -1,0 +1,234 @@
+{
+  "store_id": "STORE_BLR_002",
+  "store_name": "Purplle Brigade Bangalore",
+  "city": "Bangalore",
+  "pos_store_ref": "ST1008",
+  "open_hours": {
+    "monday":    {"open": "11:00", "close": "22:00"},
+    "tuesday":   {"open": "11:00", "close": "22:00"},
+    "wednesday": {"open": "11:00", "close": "22:00"},
+    "thursday":  {"open": "11:00", "close": "22:00"},
+    "friday":    {"open": "11:00", "close": "22:00"},
+    "saturday":  {"open": "10:00", "close": "22:00"},
+    "sunday":    {"open": "10:00", "close": "22:00"}
+  },
+  "cameras": [
+    {
+      "camera_id": "CAM_ENTRY_01",
+      "type": "entry_exit",
+      "description": "Mounted above entrance door facing inward; primary entry/exit detection camera",
+      "resolution": {"width": 1920, "height": 1080},
+      "fps": 15,
+      "clip_filename_keywords": ["entry", "entrance", "door", "threshold"],
+      "entry_line": {
+        "direction": "horizontal",
+        "y_threshold": 820,
+        "entry_direction": "bottom_to_top",
+        "comment": "Centroid crossing from y > 820 to y < 820 = ENTRY (moving into store). Reverse = EXIT."
+      },
+      "overlaps_with": ["CAM_FLOOR_01"],
+      "overlap_zone_ids": ["FRAGRANCE", "FOH"]
+    },
+    {
+      "camera_id": "CAM_FLOOR_01",
+      "type": "main_floor",
+      "description": "Ceiling wide-angle camera covering main shopping floor and brand sections",
+      "resolution": {"width": 1920, "height": 1080},
+      "fps": 15,
+      "clip_filename_keywords": ["floor", "main", "foh", "general", "wide"],
+      "overlaps_with": ["CAM_ENTRY_01"],
+      "overlap_zone_ids": ["FRAGRANCE", "FOH"]
+    },
+    {
+      "camera_id": "CAM_BILLING_01",
+      "type": "billing",
+      "description": "Mounted above cash counter area; covers billing queue and counter",
+      "resolution": {"width": 1920, "height": 1080},
+      "fps": 15,
+      "clip_filename_keywords": ["billing", "counter", "cash", "pos", "checkout"]
+    }
+  ],
+  "zones": [
+    {
+      "zone_id": "ENTRY_THRESHOLD",
+      "display_name": "Entry / Exit Threshold",
+      "sku_zone": null,
+      "is_billing": false,
+      "is_entry_exit": true,
+      "cameras": {
+        "CAM_ENTRY_01": {
+          "polygon": [[0, 750], [1920, 750], [1920, 1080], [0, 1080]]
+        }
+      }
+    },
+    {
+      "zone_id": "FRAGRANCE",
+      "display_name": "Fragrance",
+      "sku_zone": "FRAGRANCE",
+      "is_billing": false,
+      "is_entry_exit": false,
+      "cameras": {
+        "CAM_ENTRY_01": {
+          "polygon": [[0, 0], [560, 0], [560, 750], [0, 750]]
+        },
+        "CAM_FLOOR_01": {
+          "polygon": [[0, 0], [390, 0], [390, 630], [0, 630]]
+        }
+      }
+    },
+    {
+      "zone_id": "FOH",
+      "display_name": "Front of House",
+      "sku_zone": "GENERAL",
+      "is_billing": false,
+      "is_entry_exit": false,
+      "cameras": {
+        "CAM_ENTRY_01": {
+          "polygon": [[560, 0], [1920, 0], [1920, 750], [560, 750]]
+        },
+        "CAM_FLOOR_01": {
+          "polygon": [[390, 0], [1530, 0], [1530, 620], [390, 620]]
+        }
+      }
+    },
+    {
+      "zone_id": "MAKEUP_UNIT",
+      "display_name": "Makeup Consultation Unit",
+      "sku_zone": "MAKEUP",
+      "is_billing": false,
+      "is_entry_exit": false,
+      "cameras": {
+        "CAM_FLOOR_01": {
+          "polygon": [[660, 150], [1360, 150], [1360, 660], [660, 660]]
+        }
+      }
+    },
+    {
+      "zone_id": "BRAND_MAYBELLINE",
+      "display_name": "Maybelline",
+      "sku_zone": "MAKEUP",
+      "brand": "Maybelline",
+      "is_billing": false,
+      "is_entry_exit": false,
+      "cameras": {
+        "CAM_FLOOR_01": {
+          "polygon": [[0, 660], [315, 660], [315, 1080], [0, 1080]]
+        }
+      }
+    },
+    {
+      "zone_id": "BRAND_FACES",
+      "display_name": "Faces Canada",
+      "sku_zone": "MAKEUP",
+      "brand": "Faces Canada",
+      "is_billing": false,
+      "is_entry_exit": false,
+      "cameras": {
+        "CAM_FLOOR_01": {
+          "polygon": [[315, 660], [570, 660], [570, 1080], [315, 1080]]
+        }
+      }
+    },
+    {
+      "zone_id": "BRAND_LAKME",
+      "display_name": "Lakme",
+      "sku_zone": "MAKEUP",
+      "brand": "Lakme",
+      "is_billing": false,
+      "is_entry_exit": false,
+      "cameras": {
+        "CAM_FLOOR_01": {
+          "polygon": [[570, 660], [830, 660], [830, 1080], [570, 1080]]
+        }
+      }
+    },
+    {
+      "zone_id": "BRAND_SWISS_PLUS",
+      "display_name": "Swiss+",
+      "sku_zone": "SKINCARE",
+      "brand": "Swiss+",
+      "is_billing": false,
+      "is_entry_exit": false,
+      "cameras": {
+        "CAM_FLOOR_01": {
+          "polygon": [[830, 660], [1040, 660], [1040, 1080], [830, 1080]]
+        }
+      }
+    },
+    {
+      "zone_id": "BRAND_MARS_NYBAE",
+      "display_name": "Mars / NY Bae",
+      "sku_zone": "MAKEUP",
+      "brand": "NY Bae",
+      "is_billing": false,
+      "is_entry_exit": false,
+      "cameras": {
+        "CAM_FLOOR_01": {
+          "polygon": [[1040, 660], [1280, 660], [1280, 1080], [1040, 1080]]
+        }
+      }
+    },
+    {
+      "zone_id": "BRAND_ALPS",
+      "display_name": "Alps Goodness",
+      "sku_zone": "PERSONAL_CARE",
+      "brand": "Alps",
+      "is_billing": false,
+      "is_entry_exit": false,
+      "cameras": {
+        "CAM_FLOOR_01": {
+          "polygon": [[1280, 660], [1510, 660], [1510, 1080], [1280, 1080]]
+        }
+      }
+    },
+    {
+      "zone_id": "BRAND_LOREAL",
+      "display_name": "L'Oreal",
+      "sku_zone": "MAKEUP",
+      "brand": "L'Oreal",
+      "is_billing": false,
+      "is_entry_exit": false,
+      "cameras": {
+        "CAM_FLOOR_01": {
+          "polygon": [[1510, 660], [1760, 660], [1760, 1080], [1510, 1080]]
+        }
+      }
+    },
+    {
+      "zone_id": "BRAND_BEAUTY",
+      "display_name": "Beauty Corner",
+      "sku_zone": "GENERAL",
+      "is_billing": false,
+      "is_entry_exit": false,
+      "cameras": {
+        "CAM_FLOOR_01": {
+          "polygon": [[1760, 660], [1920, 660], [1920, 1080], [1760, 1080]]
+        }
+      }
+    },
+    {
+      "zone_id": "BILLING",
+      "display_name": "Billing / Cash Counter",
+      "sku_zone": null,
+      "is_billing": true,
+      "is_entry_exit": false,
+      "cameras": {
+        "CAM_BILLING_01": {
+          "polygon": [[180, 0], [1740, 0], [1740, 430], [180, 430]]
+        }
+      }
+    },
+    {
+      "zone_id": "BILLING_QUEUE",
+      "display_name": "Billing Queue Area",
+      "sku_zone": null,
+      "is_billing": true,
+      "is_entry_exit": false,
+      "cameras": {
+        "CAM_BILLING_01": {
+          "polygon": [[0, 430], [1920, 430], [1920, 1080], [0, 1080]]
+        }
+      }
+    }
+  ]
+}

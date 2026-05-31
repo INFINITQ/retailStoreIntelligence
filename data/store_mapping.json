@@ -1,0 +1,39 @@
+{
+  "version": "1.0",
+  "description": "Maps real store/POS IDs to API-format IDs and assigns clip files to camera roles.",
+  "stores": [
+    {
+      "api_store_id": "STORE_BLR_002",
+      "pos_store_id": "ST1008",
+      "store_name": "Brigade_Bangalore",
+      "city": "Bangalore",
+      "layout_file": "data/store_layout.json",
+      "pos_csv": "data/pos_transactions.csv",
+      "camera_assignment_strategy": "keyword_match",
+      "comment": "clip_index is the fallback order if keyword matching fails (0=first clip found, 1=second, etc.)",
+      "cameras": [
+        {
+          "camera_id": "CAM_ENTRY_01",
+          "clip_index": 0,
+          "type": "entry_exit",
+          "clip_start_utc": "2026-04-10T06:30:00Z",
+          "clip_filename_keywords": ["entry", "entrance", "door", "threshold", "cam1", "camera1"]
+        },
+        {
+          "camera_id": "CAM_FLOOR_01",
+          "clip_index": 1,
+          "type": "main_floor",
+          "clip_start_utc": "2026-04-10T06:30:00Z",
+          "clip_filename_keywords": ["floor", "main", "foh", "general", "wide", "cam2", "camera2"]
+        },
+        {
+          "camera_id": "CAM_BILLING_01",
+          "clip_index": 2,
+          "type": "billing",
+          "clip_start_utc": "2026-04-10T06:30:00Z",
+          "clip_filename_keywords": ["billing", "counter", "cash", "pos", "checkout", "cam3", "camera3"]
+        }
+      ]
+    }
+  ]
+}
