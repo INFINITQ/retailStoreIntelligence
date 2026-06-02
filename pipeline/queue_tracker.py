@@ -1,43 +1,58 @@
 # You are building the queue depth tracker for a retail store CCTV analytics pipeline.
 
 # FILE: pipeline/queue_tracker.py
-# PURPOSE: Track the number of people simultaneously present in billing/queue zones.
-# Maintain a rolling queue depth and flag spike events.
 
-# TECH: Python 3.11, collections (deque), datetime, typing
+from collections import deque
+from datetime import datetime
+from typing import Optional
 
-# IMPLEMENT THE FOLLOWING:
 
-# 1. `class QueueTracker:`
+class QueueTracker:
+    def __init__(self, spike_threshold: int = 5) -> None:
+        self.spike_threshold = spike_threshold
+        self.current_depth: int = 0
+        self.queue_members: set[int] = set()
+        self.depth_history: deque = deque(maxlen=100)
+        self.spike_active: bool = False
 
-#    `__init__(self, spike_threshold: int = 5):`
-#    - `self.spike_threshold = spike_threshold`
-#    - `self.current_depth: int = 0`
-#    - `self.queue_members: set[int]` — set of track_ids currently in billing/queue zone.
-#    - `self.depth_history: deque` — deque(maxlen=100) of (timestamp, depth) tuples
-#      for rolling average.
-#    - `self.spike_active: bool = False`
+    def update(self, active_billing_track_ids: set, timestamp: datetime) -> dict:
+        old_members = set(self.queue_members)
+        new_depth = len(active_billing_track_ids)
 
-#    `update(self, active_billing_track_ids: set[int], timestamp: datetime) -> dict:`
-#    - active_billing_track_ids: set of track_ids currently in BILLING or BILLING_QUEUE zone.
-#    - Compute new depth = len(active_billing_track_ids).
-#    - Append (timestamp, new_depth) to depth_history.
-#    - Update self.current_depth and self.queue_members.
-#    - Detect spike: if new_depth >= spike_threshold and not self.spike_active → set spike_active=True.
-#    - Detect spike end: if new_depth < spike_threshold and self.spike_active → set spike_active=False.
-#    - Return dict: {"depth": int, "spike_started": bool, "spike_ended": bool,
-#                    "newly_joined": set[int], "newly_left": set[int]}
-#    - newly_joined = active_billing_track_ids - old queue_members
-#    - newly_left = old queue_members - active_billing_track_ids
+        self.depth_history.append((timestamp, new_depth))
+        self.current_depth = new_depth
+        self.queue_members = set(active_billing_track_ids)
 
-#    `get_current_depth(self) -> int:`
-#    - Returns self.current_depth.
+        newly_joined = active_billing_track_ids - old_members
+        newly_left = old_members - active_billing_track_ids
 
-#    `get_rolling_avg(self, window_frames: int = 30) -> float:`
-#    - Average depth over the last `window_frames` entries in depth_history.
-#    - Returns 0.0 if history is empty.
+        spike_started = False
+        spike_ended = False
 
-#    `reset(self) -> None:`
-#    - Clear queue_members, reset current_depth to 0.
+        if new_depth >= self.spike_threshold and not self.spike_active:
+            self.spike_active = True
+            spike_started = True
+        elif new_depth < self.spike_threshold and self.spike_active:
+            self.spike_active = False
+            spike_ended = True
 
-# IMPORTS NEEDED: collections (deque), datetime, typing (Optional)
+        return {
+            "depth": new_depth,
+            "spike_started": spike_started,
+            "spike_ended": spike_ended,
+            "newly_joined": newly_joined,
+            "newly_left": newly_left,
+        }
+
+    def get_current_depth(self) -> int:
+        return self.current_depth
+
+    def get_rolling_avg(self, window_frames: int = 30) -> float:
+        if not self.depth_history:
+            return 0.0
+        recent = list(self.depth_history)[-window_frames:]
+        return sum(d for _, d in recent) / len(recent)
+
+    def reset(self) -> None:
+        self.queue_members = set()
+        self.current_depth = 0

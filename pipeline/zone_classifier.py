@@ -1,58 +1,108 @@
 # You are building the zone classifier for a retail store CCTV analytics pipeline.
 
 # FILE: pipeline/zone_classifier.py
-# PURPOSE: Given a camera ID and a bounding-box foot-point (bottom-center of bbox in pixel coords), determine which zone the person is in. Also detect entry/exit line crossings. Uses shapely for polygon containment.
 
-# TECH: Python 3.11, shapely==2.0.6, json, typing
+import json
+from typing import Optional
 
-# CONTEXT:
-# - store_layout.json defines zones. Each zone has a `cameras` dict mapping camera_id → `{"polygon": [[x,y], ...]}`.
-# - Polygons are in pixel coordinates for 1920×1080 resolution.
-# - The entry camera (CAM_ENTRY_01) has an `entry_line` in its camera config: `{"direction": "horizontal", "y_threshold": 820, "entry_direction": "bottom_to_top"}`.
-# - Zones with `is_entry_exit: true` are the ENTRY_THRESHOLD zone — used for crossing detection, not dwell.
-# - Zones with `is_billing: true` are billing/queue zones.
+from shapely.geometry import Point, Polygon
 
-# IMPLEMENT THE FOLLOWING FUNCTIONS:
 
-# 1. `class ZoneClassifier:`
+def get_foot_point(bbox_xyxy: list) -> tuple:
+    """Return bottom-center of a bounding box: ((x1+x2)/2, y2)."""
+    x1, y1, x2, y2 = bbox_xyxy
+    return ((x1 + x2) / 2, y2)
 
-#    `__init__(self, layout_path: str):`
-#    - Load and parse store_layout.json.
-#    - Build a dict `self.camera_zones: dict[str, list[tuple[str, Polygon]]]` mapping
-#      camera_id → list of (zone_id, shapely.Polygon). Sort so billing zones come last
-#      (least priority for general classification).
-#    - Build a dict `self.zone_meta: dict[str, dict]` mapping zone_id → zone metadata
-#      (is_billing, is_entry_exit, sku_zone, display_name).
-#    - Build a dict `self.entry_lines: dict[str, dict]` mapping camera_id → entry_line config
-#      (only for cameras that have entry_line defined).
 
-#    `classify_zone(self, camera_id: str, foot_x: float, foot_y: float) -> str | None:`
-#    - Compute which zone polygon contains the point (foot_x, foot_y) for the given camera_id.
-#    - Returns the zone_id of the first matching polygon (check non-entry-exit zones first).
-#    - Returns None if no zone matches.
+class ZoneClassifier:
+    def __init__(self, layout_path: str) -> None:
+        try:
+            with open(layout_path, "r", encoding="utf-8") as f:
+                layout = json.load(f)
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"store_layout.json not found at {layout_path!r}. "
+                "Did you set --layout correctly?"
+            )
 
-#    `check_entry_crossing(self, camera_id: str, prev_foot_y: float, curr_foot_y: float) -> str | None:`
-#    - Only valid for cameras with `entry_line` defined (CAM_ENTRY_01).
-#    - Reads y_threshold from the entry_line config.
-#    - entry_direction = "bottom_to_top" means: prev_foot_y > y_threshold AND curr_foot_y <= y_threshold → "ENTRY".
-#    - Reverse crossing → "EXIT".
-#    - Returns "ENTRY", "EXIT", or None.
+        self.zone_meta: dict[str, dict] = {}
+        self.camera_zones: dict[str, list[tuple[str, Polygon]]] = {}
+        self.entry_lines: dict[str, dict] = {}
 
-#    `get_zone_meta(self, zone_id: str) -> dict:`
-#    - Returns the metadata dict for a zone. Returns empty dict if not found.
+        for zone in layout.get("zones", []):
+            zid = zone["zone_id"]
+            self.zone_meta[zid] = {
+                "is_billing": zone.get("is_billing", False),
+                "is_entry_exit": zone.get("is_entry_exit", False),
+                "sku_zone": zone.get("sku_zone"),
+                "display_name": zone.get("display_name", zid),
+            }
 
-#    `get_billing_zones(self, camera_id: str) -> list[str]:`
-#    - Returns list of zone_ids visible from camera_id that have is_billing=True.
+            for cam_id, cam_data in zone.get("cameras", {}).items():
+                coords = cam_data.get("polygon", [])
+                if len(coords) < 3:
+                    print(f"[ZoneClassifier] Warning: zone {zid} cam {cam_id} has <3 polygon points — skipped.")
+                    continue
+                poly = Polygon(coords)
+                self.camera_zones.setdefault(cam_id, []).append((zid, poly))
 
-#    `get_zones_for_camera(self, camera_id: str) -> list[str]:`
-#    - Returns all zone_ids visible from the given camera.
+        # Sort so non-entry-exit, non-billing zones come first (higher priority)
+        for cam_id in self.camera_zones:
+            self.camera_zones[cam_id].sort(
+                key=lambda item: (
+                    self.zone_meta.get(item[0], {}).get("is_billing", False),
+                    self.zone_meta.get(item[0], {}).get("is_entry_exit", False),
+                )
+            )
 
-# 2. Standalone helper:
-#    `get_foot_point(bbox_xyxy: list[float]) -> tuple[float, float]:`
-#    - bbox_xyxy = [x1, y1, x2, y2]
-#    - Returns bottom-center: ((x1+x2)/2, y2)
+        # Load entry lines from cameras section
+        for cam in layout.get("cameras", []):
+            if "entry_line" in cam:
+                self.entry_lines[cam["camera_id"]] = cam["entry_line"]
 
-# IMPORTS NEEDED: json, shapely.geometry (Point, Polygon), typing (Optional)
+    def classify_zone(self, camera_id: str, foot_x: float, foot_y: float) -> Optional[str]:
+        """Return zone_id for the point, or None if not in any zone."""
+        pt = Point(foot_x, foot_y)
+        for zone_id, poly in self.camera_zones.get(camera_id, []):
+            if self.zone_meta.get(zone_id, {}).get("is_entry_exit", False):
+                continue  # skip entry/exit threshold for general classification
+            if poly.contains(pt):
+                return zone_id
+        return None
 
-# ERROR HANDLING: If a polygon has fewer than 3 points, skip it with a warning print.
-# If layout_path doesn't exist, raise FileNotFoundError with a helpful message.
+    def check_entry_crossing(
+        self, camera_id: str, prev_foot_y: float, curr_foot_y: float
+    ) -> Optional[str]:
+        """Detect direction crossing of the entry threshold line."""
+        entry_cfg = self.entry_lines.get(camera_id)
+        if entry_cfg is None:
+            return None
+
+        y_thresh = entry_cfg["y_threshold"]
+        direction = entry_cfg.get("entry_direction", "bottom_to_top")
+
+        if direction == "bottom_to_top":
+            if prev_foot_y > y_thresh and curr_foot_y <= y_thresh:
+                return "ENTRY"
+            if prev_foot_y <= y_thresh and curr_foot_y > y_thresh:
+                return "EXIT"
+        else:
+            if prev_foot_y < y_thresh and curr_foot_y >= y_thresh:
+                return "ENTRY"
+            if prev_foot_y >= y_thresh and curr_foot_y < y_thresh:
+                return "EXIT"
+
+        return None
+
+    def get_zone_meta(self, zone_id: str) -> dict:
+        return self.zone_meta.get(zone_id, {})
+
+    def get_billing_zones(self, camera_id: str) -> list[str]:
+        return [
+            zone_id
+            for zone_id, _ in self.camera_zones.get(camera_id, [])
+            if self.zone_meta.get(zone_id, {}).get("is_billing", False)
+        ]
+
+    def get_zones_for_camera(self, camera_id: str) -> list[str]:
+        return [zone_id for zone_id, _ in self.camera_zones.get(camera_id, [])]

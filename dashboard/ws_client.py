@@ -1,52 +1,97 @@
 # You are writing a WebSocket + polling API client helper for a Streamlit retail analytics dashboard.
 
 # FILE: dashboard/ws_client.py
-# PURPOSE: Provides a clean client class that the Streamlit dashboard uses to fetch data from
-# the Store Intelligence API. Handles connection errors gracefully. Also provides a thread-based
-# Redis subscriber for near-real-time event counting without blocking Streamlit's main thread.
 
-# TECH: Python 3.11, httpx==0.28.1, threading, queue (stdlib), json, os
+import json
+import threading
+import time
+from typing import Optional
 
-# IMPLEMENT:
+import httpx
 
-# 1. `class APIClient:`
-#    `__init__(self, base_url: str):`
-#    - self.base_url = base_url.rstrip("/")
-#    - self.session = httpx.Client(timeout=5.0, follow_redirects=True)
 
-#    `get_metrics(self, store_id: str, window_hours: int = 24) -> dict | None:`
-#    `get_funnel(self, store_id: str, window_hours: int = 24) -> dict | None:`
-#    `get_heatmap(self, store_id: str, window_hours: int = 24) -> dict | None:`
-#    `get_anomalies(self, store_id: str) -> dict | None:`
-#    `get_health(self) -> dict | None:`
-#    Each method:
-#    - Calls the corresponding endpoint via self.session.get(...).
-#    - Returns response.json() on 2xx, None on any error (log the error).
+class APIClient:
+    def __init__(self, base_url: str) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.session = httpx.Client(timeout=5.0, follow_redirects=True)
 
-#    `close(self) -> None:` — closes self.session.
+    def _get(self, url: str) -> Optional[dict]:
+        try:
+            resp = self.session.get(url)
+            if resp.is_success:
+                return resp.json()
+            return None
+        except Exception as exc:
+            print(f"[APIClient] GET {url} failed: {exc}")
+            return None
 
-# 2. `class EventStreamSubscriber:`
-#    PURPOSE: Subscribes to Redis "store_events" pub/sub channel in a background thread.
-#    Maintains a counter of events received per store_id since last reset.
+    def get_metrics(self, store_id: str, window_hours: int = 24) -> Optional[dict]:
+        return self._get(f"{self.base_url}/stores/{store_id}/metrics?window_hours={window_hours}")
 
-#    `__init__(self, redis_url: str):`
-#    - self.redis_url = redis_url
-#    - self._event_counts: dict[str, int] = {}
-#    - self._lock = threading.Lock()
-#    - self._stop_event = threading.Event()
-#    - self._thread: threading.Thread (daemon=True)
+    def get_funnel(self, store_id: str, window_hours: int = 24) -> Optional[dict]:
+        return self._get(f"{self.base_url}/stores/{store_id}/funnel?window_hours={window_hours}")
 
-#    `start(self) -> None:` — starts background thread.
-#    `stop(self) -> None:` — sets stop_event; joins thread.
-#    `get_event_count(self, store_id: str) -> int:` — thread-safe read.
-#    `reset_count(self, store_id: str) -> None:` — thread-safe reset to 0.
+    def get_heatmap(self, store_id: str, window_hours: int = 24) -> Optional[dict]:
+        return self._get(f"{self.base_url}/stores/{store_id}/heatmap?window_hours={window_hours}")
 
-#    Background thread logic:
-#    - Try to connect to Redis (redis.Redis.from_url with decode_responses=True).
-#    - Subscribe to "store_events". Listen in a loop; on each message:
-#      - Parse JSON; extract store_id.
-#      - Increment self._event_counts[store_id].
-#    - On ConnectionError: sleep 5s, retry. If stop_event set: exit.
+    def get_anomalies(self, store_id: str) -> Optional[dict]:
+        return self._get(f"{self.base_url}/stores/{store_id}/anomalies")
 
-# IMPORTS NEEDED: httpx, threading, json, os, time, typing (Optional)
-# (import redis only inside the thread function so the module remains importable without Redis)
+    def get_health(self) -> Optional[dict]:
+        return self._get(f"{self.base_url}/health")
+
+    def close(self) -> None:
+        self.session.close()
+
+
+class EventStreamSubscriber:
+    """Subscribe to Redis 'store_events' pub/sub in a background thread."""
+
+    def __init__(self, redis_url: str) -> None:
+        self.redis_url = redis_url
+        self._event_counts: dict[str, int] = {}
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=5.0)
+
+    def get_event_count(self, store_id: str) -> int:
+        with self._lock:
+            return self._event_counts.get(store_id, 0)
+
+    def reset_count(self, store_id: str) -> None:
+        with self._lock:
+            self._event_counts[store_id] = 0
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                import redis  # imported here so module is importable without Redis
+
+                client = redis.Redis.from_url(self.redis_url, decode_responses=True)
+                pubsub = client.pubsub()
+                pubsub.subscribe("store_events")
+
+                for message in pubsub.listen():
+                    if self._stop_event.is_set():
+                        break
+                    if message.get("type") != "message":
+                        continue
+                    try:
+                        data = json.loads(message["data"])
+                        sid = data.get("store_id", "unknown")
+                        with self._lock:
+                            self._event_counts[sid] = self._event_counts.get(sid, 0) + 1
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
+            except Exception as exc:
+                if not self._stop_event.is_set():
+                    print(f"[EventStreamSubscriber] Redis error: {exc} — retrying in 5s")
+                    time.sleep(5)

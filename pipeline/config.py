@@ -1,40 +1,60 @@
 # You are building the configuration module for a retail store CCTV analytics pipeline called Store Intelligence.
 
 # FILE: pipeline/config.py
-# PURPOSE: Central configuration loader for the detection pipeline. Reads all settings from environment variables (via python-dotenv) with sensible defaults. Exposes a single frozen dataclass instance called `cfg` that all other pipeline modules import.
+# PURPOSE: Central configuration loader for the detection pipeline.
 
-# TECH: Python 3.11, python-dotenv==1.0.1, dataclasses, os
+import os
+from dataclasses import dataclass
 
-# IMPLEMENT THE FOLLOWING:
+from dotenv import load_dotenv
 
-# 1. Call `load_dotenv()` at module level to load a `.env` file if present.
+load_dotenv()
 
-# 2. Define a frozen dataclass `PipelineConfig` with these fields and types:
-#    - store_layout_path: str = "data/store_layout.json"
-#    - store_mapping_path: str = "data/store_mapping.json"
-#    - pos_csv_path: str = "data/pos_transactions.csv"
-#    - output_dir: str = "data/events"
-#    - api_base_url: str = "http://localhost:8000"
-#    - confidence_threshold: float = 0.35         # min YOLO detection confidence
-#    - reid_similarity_threshold: float = 0.65    # cosine similarity for Re-ID match
-#    - dwell_threshold_seconds: int = 30          # seconds before emitting ZONE_DWELL
-#    - frame_skip: int = 3                        # process every Nth frame (CPU optimisation)
-#    - inference_width: int = 640                 # resize width before YOLO inference
-#    - inference_height: int = 360               # resize height before YOLO inference
-#    - yolo_model: str = "yolov8n.pt"            # nano model for CPU speed
-#    - post_to_api: bool = True                   # whether to POST events to API
-#    - api_batch_size: int = 50                   # events per API POST batch
-#    - pos_correlation_window_minutes: int = 5    # POS correlation time window
-#    - queue_spike_threshold: int = 5             # queue depth to flag spike
-#    - log_level: str = "INFO"
 
-# 3. Instantiate the dataclass as a module-level singleton:
-#    `cfg = PipelineConfig()`
-#    where each field reads from `os.getenv(FIELD_NAME_UPPERCASE, default_value)`.
-#    Cast numeric types explicitly (float(), int()) from env strings.
+@dataclass(frozen=True)
+class PipelineConfig:
+    store_layout_path: str = "data/store_layout.json"
+    store_mapping_path: str = "data/store_mapping.json"
+    pos_csv_path: str = "data/pos_transactions.csv"
+    output_dir: str = "data/events"
+    api_base_url: str = "http://localhost:8000"
+    confidence_threshold: float = 0.35
+    reid_similarity_threshold: float = 0.65
+    dwell_threshold_seconds: int = 30
+    frame_skip: int = 3
+    inference_width: int = 640
+    inference_height: int = 360
+    yolo_model: str = "yolov8n.pt"
+    post_to_api: bool = True
+    api_batch_size: int = 50
+    pos_correlation_window_minutes: int = 5
+    queue_spike_threshold: int = 5
+    log_level: str = "INFO"
 
-# 4. Add a `__repr__` that prints all config values (for startup logging).
+    def __repr__(self) -> str:  # noqa: D105
+        lines = ["PipelineConfig("]
+        for f in self.__dataclass_fields__:  # type: ignore[attr-defined]
+            lines.append(f"  {f}={getattr(self, f)!r},")
+        lines.append(")")
+        return "\n".join(lines)
 
-# IMPORTS NEEDED: os, dataclasses (dataclass, field), python-dotenv (load_dotenv)
 
-# No external dependencies beyond the standard library and python-dotenv.
+cfg = PipelineConfig(
+    store_layout_path=os.getenv("STORE_LAYOUT_PATH", "data/store_layout.json"),
+    store_mapping_path=os.getenv("STORE_MAPPING_PATH", "data/store_mapping.json"),
+    pos_csv_path=os.getenv("POS_CSV_PATH", "data/pos_transactions.csv"),
+    output_dir=os.getenv("OUTPUT_DIR", "data/events"),
+    api_base_url=os.getenv("API_BASE_URL", "http://localhost:8000"),
+    confidence_threshold=float(os.getenv("CONFIDENCE_THRESHOLD", "0.35")),
+    reid_similarity_threshold=float(os.getenv("REID_SIMILARITY_THRESHOLD", "0.65")),
+    dwell_threshold_seconds=int(os.getenv("DWELL_THRESHOLD_SECONDS", "30")),
+    frame_skip=int(os.getenv("FRAME_SKIP", "3")),
+    inference_width=int(os.getenv("INFERENCE_WIDTH", "640")),
+    inference_height=int(os.getenv("INFERENCE_HEIGHT", "360")),
+    yolo_model=os.getenv("YOLO_MODEL", "yolov8n.pt"),
+    post_to_api=os.getenv("POST_TO_API", "true").lower() == "true",
+    api_batch_size=int(os.getenv("API_BATCH_SIZE", "50")),
+    pos_correlation_window_minutes=int(os.getenv("POS_CORRELATION_WINDOW_MINUTES", "5")),
+    queue_spike_threshold=int(os.getenv("QUEUE_SPIKE_THRESHOLD", "5")),
+    log_level=os.getenv("LOG_LEVEL", "INFO"),
+)

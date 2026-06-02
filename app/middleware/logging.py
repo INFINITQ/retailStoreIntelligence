@@ -5,40 +5,85 @@
 # logs structured request/response metadata using structlog, and ensures all 500 errors
 # return a clean JSON body (no raw stack traces).
 
-# TECH: Python 3.11, fastapi, starlette, structlog==24.4.0, uuid
+import time
+import uuid
 
-# IMPLEMENT:
+import structlog
+import structlog.contextvars
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
 
-# 1. At module level, configure structlog:
-#    - Processors: add_log_level, add_timestamp (ISO format), structlog.stdlib.PositionalArgumentsFormatter,
-#      structlog.processors.StackInfoRenderer, structlog.dev.ConsoleRenderer in development,
-#      structlog.processors.JSONRenderer in production.
-#    - Read environment from app.config.settings.environment.
-#    - Bind trace_id to a context variable using structlog.contextvars.
+from app.config import settings
 
-# 2. `class RequestLoggingMiddleware(BaseHTTPMiddleware):`
+# ---------------------------------------------------------------------------
+# Configure structlog once at module import time
+# ---------------------------------------------------------------------------
+_shared_processors = [
+    structlog.contextvars.merge_contextvars,
+    structlog.stdlib.add_log_level,
+    structlog.processors.TimeStamper(fmt="iso"),
+    structlog.stdlib.PositionalArgumentsFormatter(),
+    structlog.processors.StackInfoRenderer(),
+]
 
-#    `async def dispatch(self, request: Request, call_next) -> Response:`
-#    - Generate trace_id = str(uuid.uuid4()).
-#    - Extract store_id from path params if present (check request.path_params.get("store_id")).
-#    - Bind structlog context: structlog.contextvars.bind_contextvars(
-#        trace_id=trace_id, store_id=store_id, path=request.url.path,
-#        method=request.method, client_ip=request.client.host if request.client else "unknown")
-#    - Record start = time.perf_counter().
-#    - Call call_next(request) in try/except:
-#      - On unhandled exception: log error with exc_info, return JSONResponse(status_code=500,
-#        content={"error": "Internal server error", "trace_id": trace_id})
-#    - After response: compute latency_ms = round((time.perf_counter()-start)*1000, 2).
-#    - Log structured info: trace_id, store_id, endpoint=request.url.path,
-#      method=request.method, status_code=response.status_code, latency_ms=latency_ms.
-#    - Add X-Trace-Id header to response.
-#    - Clear structlog context after response.
-#    - Return response.
+if settings.environment == "production":
+    _final_processor = structlog.processors.JSONRenderer()
+else:
+    _final_processor = structlog.dev.ConsoleRenderer()
 
-# 3. `def get_logger(name: str = __name__):`
-#    - Returns structlog.get_logger(name).
+structlog.configure(
+    processors=_shared_processors + [_final_processor],
+    wrapper_class=structlog.BoundLogger,
+    context_class=dict,
+    logger_factory=structlog.PrintLoggerFactory(),
+)
 
-# IMPORTS NEEDED:
-#   fastapi (Request), fastapi.responses (JSONResponse), starlette.middleware.base (BaseHTTPMiddleware),
-#   starlette.responses (Response), structlog, structlog.contextvars, uuid, time,
-#   app.config (settings)
+
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next) -> Response:
+        trace_id = str(uuid.uuid4())
+        store_id = request.path_params.get("store_id", None)
+
+        structlog.contextvars.clear_contextvars()
+        structlog.contextvars.bind_contextvars(
+            trace_id=trace_id,
+            store_id=store_id,
+            path=request.url.path,
+            method=request.method,
+            client_ip=request.client.host if request.client else "unknown",
+        )
+
+        start = time.perf_counter()
+        log = structlog.get_logger(__name__)
+
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            log.error("Unhandled exception", exc_info=exc)
+            structlog.contextvars.clear_contextvars()
+            return JSONResponse(
+                status_code=500,
+                content={"error": "Internal server error", "trace_id": trace_id},
+            )
+
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+
+        log.info(
+            "request_handled",
+            trace_id=trace_id,
+            store_id=store_id,
+            endpoint=request.url.path,
+            method=request.method,
+            status_code=response.status_code,
+            latency_ms=latency_ms,
+        )
+
+        response.headers["X-Trace-Id"] = trace_id
+        structlog.contextvars.clear_contextvars()
+        return response
+
+
+def get_logger(name: str = __name__):
+    return structlog.get_logger(name)

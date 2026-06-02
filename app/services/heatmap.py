@@ -2,40 +2,115 @@
 
 # FILE: app/services/heatmap.py
 # PURPOSE: Compute per-zone visit frequency and average dwell for GET /stores/{id}/heatmap.
-# Normalise scores 0–100 and flag low-confidence zones (fewer than 20 sessions).
 
-# TECH: Python 3.11, sqlalchemy.ext.asyncio, json
+import json
+from datetime import datetime, timedelta, timezone
 
-# IMPLEMENT:
+from sqlalchemy import and_, distinct, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-# `async def compute_heatmap(db: AsyncSession, store_id: str, window_hours: int = 24) -> HeatmapResponse:`
+from app.config import settings
+from app.models.db_models import Event, VisitorSession
+from app.models.schemas import HeatmapResponse, ZoneHeatmap
 
-# 1. Compute window.
 
-# 2. Load zone definitions from store_layout.json. Build a dict
-#    {zone_id: display_name} for all non-entry-exit zones.
+def _load_zone_defs(layout_path: str) -> dict[str, str]:
+    """Return {zone_id: display_name} excluding entry/exit zones."""
+    try:
+        with open(layout_path, "r", encoding="utf-8") as f:
+            layout = json.load(f)
+        result = {}
+        for z in layout.get("zones", []):
+            if not z.get("is_entry_exit", False):
+                result[z["zone_id"]] = z.get("display_name", z["zone_id"])
+        return result
+    except Exception:
+        return {}
 
-# 3. Query the Event table: SELECT zone_id, COUNT(DISTINCT visitor_id) as visit_count,
-#    AVG(dwell_ms) as avg_dwell_ms FROM events WHERE store_id=store_id AND is_staff=False
-#    AND zone_id IS NOT NULL AND zone_id NOT IN ('ENTRY_THRESHOLD')
-#    AND timestamp IN window GROUP BY zone_id.
 
-# 4. Count total sessions in window (from VisitorSession) for the data_confidence flag.
+async def compute_heatmap(
+    db: AsyncSession, store_id: str, window_hours: int = 24
+) -> HeatmapResponse:
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(hours=window_hours)
 
-# 5. For each zone in zone definitions (not just those with events — include zero-visit zones too):
-#    - visit_count = result from query, default 0.
-#    - avg_dwell_ms = result from query, default 0.0.
-#    - data_confidence = (total_sessions >= 20).
+    # Load zone definitions (all non-entry-exit zones)
+    zone_defs = _load_zone_defs(settings.store_layout_path)
 
-# 6. Normalise: find max_visits across all zones. normalized_score = (zone_visits / max_visits) * 100.
-#    If max_visits == 0, all scores = 0.0.
+    # Query event aggregates per zone
+    agg_result = await db.execute(
+        select(
+            Event.zone_id,
+            func.count(distinct(Event.visitor_id)).label("visit_count"),
+            func.avg(Event.dwell_ms).label("avg_dwell_ms"),
+        ).where(
+            and_(
+                Event.store_id == store_id,
+                Event.is_staff == False,
+                Event.zone_id.isnot(None),
+                Event.zone_id != "ENTRY_THRESHOLD",
+                Event.timestamp >= window_start,
+                Event.timestamp <= now,
+            )
+        ).group_by(Event.zone_id)
+    )
+    agg_rows = agg_result.all()
+    zone_data: dict[str, dict] = {}
+    for row in agg_rows:
+        zone_data[row.zone_id] = {
+            "visit_count": row.visit_count or 0,
+            "avg_dwell_ms": float(row.avg_dwell_ms or 0.0),
+        }
 
-# 7. Sort zones by normalized_score descending.
+    # Total sessions for data_confidence
+    total_sessions_result = await db.execute(
+        select(func.count(distinct(VisitorSession.visitor_id))).where(
+            and_(
+                VisitorSession.store_id == store_id,
+                VisitorSession.is_staff == False,
+                VisitorSession.entry_timestamp >= window_start,
+                VisitorSession.entry_timestamp <= now,
+            )
+        )
+    )
+    total_sessions: int = total_sessions_result.scalar_one() or 0
+    data_confidence: bool = total_sessions >= 20
 
-# 8. Return HeatmapResponse with all zones, window timestamps.
+    # Build per-zone list including zero-visit zones
+    all_zones: list[dict] = []
+    for zone_id, display_name in zone_defs.items():
+        d = zone_data.get(zone_id, {"visit_count": 0, "avg_dwell_ms": 0.0})
+        all_zones.append(
+            {
+                "zone_id": zone_id,
+                "display_name": display_name,
+                "visit_count": d["visit_count"],
+                "avg_dwell_ms": d["avg_dwell_ms"],
+            }
+        )
 
-# IMPORTS NEEDED:
-#   sqlalchemy.ext.asyncio (AsyncSession), sqlalchemy (select, func, distinct, and_),
-#   datetime (datetime, timedelta, timezone), json,
-#   app.models.db_models (Event, VisitorSession),
-#   app.models.schemas (HeatmapResponse, ZoneHeatmap), app.config (settings)
+    # Normalise scores
+    max_visits = max((z["visit_count"] for z in all_zones), default=0)
+
+    zones: list[ZoneHeatmap] = []
+    for z in all_zones:
+        norm = (z["visit_count"] / max_visits * 100) if max_visits > 0 else 0.0
+        zones.append(
+            ZoneHeatmap(
+                zone_id=z["zone_id"],
+                display_name=z["display_name"],
+                visit_count=z["visit_count"],
+                avg_dwell_ms=round(z["avg_dwell_ms"], 2),
+                normalized_score=round(norm, 2),
+                data_confidence=data_confidence,
+            )
+        )
+
+    zones.sort(key=lambda z: z.normalized_score, reverse=True)
+
+    return HeatmapResponse(
+        store_id=store_id,
+        window_start=window_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        window_end=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        zones=zones,
+    )

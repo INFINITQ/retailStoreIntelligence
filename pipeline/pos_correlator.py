@@ -1,65 +1,170 @@
 # You are building the POS transaction correlator for a retail store CCTV analytics pipeline.
 
 # FILE: pipeline/pos_correlator.py
-# PURPOSE: Load the POS transactions CSV, and for each transaction determine which visitor
-# sessions were in the billing zone in the 5-minute window before the transaction timestamp.
-# Those sessions are marked as "converted". Also detect BILLING_QUEUE_ABANDON events.
 
-# TECH: Python 3.11, pandas==2.2.3, datetime, typing
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
-# CONTEXT:
-# - POS CSV columns include: order_id, order_date (DD-MM-YYYY), order_time (HH:MM:SS),
-#   store_id (real ID like "ST1008"), and total_amount.
-# - store_mapping.json maps "ST1008" → "STORE_BLR_002" (api_store_id).
-# - A visitor session is "converted" if their visitor_id had a BILLING or BILLING_QUEUE
-#   event within 5 minutes before a transaction at the same store.
-# - BILLING_QUEUE_ABANDON: visitor had a BILLING_QUEUE_JOIN event but no POS transaction
-#   followed within 15 minutes AND they emitted a subsequent EXIT.
+import pandas as pd
 
-# IMPLEMENT THE FOLLOWING:
 
-# 1. `class POSCorrelator:`
+IST_OFFSET = timedelta(hours=5, minutes=30)
 
-#    `__init__(self, csv_path: str, store_mapping: dict,
-#              correlation_window_minutes: int = 5):`
-#    - Load the CSV with pandas. Handle the date format "DD-MM-YYYY".
-#    - Create a `transaction_timestamp` column: combine order_date + order_time → UTC datetime.
-#    - Filter to only rows matching the api_store_id derived from store_mapping.
-#    - Deduplicate by order_id (keep first row per order since CSV has one row per item).
-#    - `self.transactions: pd.DataFrame` — deduplicated transactions sorted by timestamp.
-#    - `self.correlation_window = timedelta(minutes=correlation_window_minutes)`
-#    - `self.abandon_window = timedelta(minutes=15)`
 
-#    `build_billing_timeline(self, events: list[dict]) -> dict:`
-#    - events: list of event dicts emitted by the pipeline (all types).
-#    - Build and return a dict:
-#      {
-#        "billing_intervals": list of {"visitor_id": str, "enter_ts": datetime, "exit_ts": datetime|None},
-#        "queue_joins": list of {"visitor_id": str, "join_ts": datetime}
-#      }
-#    - Derive billing_intervals from BILLING_QUEUE_JOIN and subsequent EXIT/ZONE_EXIT events.
+def parse_pos_timestamp(date_str: str, time_str: str) -> datetime:
+    """Parse 'DD-MM-YYYY' + 'HH:MM:SS' in IST → UTC datetime."""
+    combined = f"{date_str} {time_str}"
+    dt = datetime.strptime(combined, "%d-%m-%Y %H:%M:%S")
+    ist_dt = dt.replace(tzinfo=timezone(IST_OFFSET))
+    return ist_dt.astimezone(timezone.utc)
 
-#    `find_converted_sessions(self, billing_timeline: dict) -> set[str]:`
-#    - For each transaction in self.transactions:
-#      - Find all billing_intervals where the visitor's billing window overlaps
-#        the 5 minutes before transaction_timestamp.
-#      - Add those visitor_ids to the converted set.
-#    - Return set of converted visitor_ids.
 
-#    `find_abandoned_sessions(self, billing_timeline: dict,
-#                              converted_visitor_ids: set[str]) -> list[str]:`
-#    - For each queue_join not in converted_visitor_ids:
-#      - Check if that visitor exited within abandon_window.
-#      - If yes: classify as BILLING_QUEUE_ABANDON.
-#    - Return list of visitor_ids who abandoned.
+class POSCorrelator:
+    def __init__(
+        self,
+        csv_path: str,
+        store_mapping: dict,
+        correlation_window_minutes: int = 5,
+    ) -> None:
+        self.correlation_window = timedelta(minutes=correlation_window_minutes)
+        self.abandon_window = timedelta(minutes=15)
 
-#    `get_transaction_count(self) -> int:`
-#    - Returns len(self.transactions).
+        # Resolve api_store_id from mapping
+        api_store_id = None
+        for store in store_mapping.get("stores", []):
+            api_store_id = store.get("api_store_id")
+            break
 
-# 2. Standalone helper:
-#    `parse_pos_timestamp(date_str: str, time_str: str) -> datetime:`
-#    - Parse "10-04-2026" + "16:55:36" → timezone-aware UTC datetime.
-#    - date_str format: DD-MM-YYYY. Assume IST (UTC+5:30), convert to UTC.
+        # Load CSV
+        try:
+            df = pd.read_csv(csv_path, dtype=str)
+        except FileNotFoundError:
+            self.transactions = pd.DataFrame()
+            return
 
-# IMPORTS NEEDED: pandas as pd, datetime (datetime, timedelta, timezone),
-# typing (Optional), json, os
+        # Detect date/time columns flexibly
+        date_col = self._find_col(df, ["order_date", "date"])
+        time_col = self._find_col(df, ["order_time", "time"])
+        id_col = self._find_col(df, ["order_id", "transaction_id"])
+        store_col = self._find_col(df, ["store_id"])
+        amount_col = self._find_col(df, ["total_amount", "basket_value_inr", "amount"])
+
+        if date_col and time_col:
+            df["transaction_timestamp"] = df.apply(
+                lambda r: parse_pos_timestamp(r[date_col], r[time_col]), axis=1
+            )
+        else:
+            self.transactions = pd.DataFrame()
+            return
+
+        # Filter to this store
+        if store_col and api_store_id:
+            pos_ref = None
+            for store in store_mapping.get("stores", []):
+                pos_ref = store.get("pos_store_id")
+                break
+            if pos_ref:
+                df = df[df[store_col] == pos_ref]
+
+        # Deduplicate by order_id
+        if id_col:
+            df = df.drop_duplicates(subset=[id_col], keep="first")
+
+        df = df.sort_values("transaction_timestamp").reset_index(drop=True)
+        self.transactions = df
+        self._amount_col = amount_col
+        self._id_col = id_col
+
+    @staticmethod
+    def _find_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+        for c in candidates:
+            for col in df.columns:
+                if col.lower().strip() == c.lower():
+                    return col
+        return None
+
+    def build_billing_timeline(self, events: list[dict]) -> dict:
+        """Build billing_intervals and queue_joins from emitted events."""
+        billing_intervals = []
+        queue_joins = []
+        open_billing: dict[str, datetime] = {}
+
+        # Sort by timestamp
+        def _parse(ts: str) -> datetime:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+        for evt in sorted(events, key=lambda e: e.get("timestamp", "")):
+            etype = evt.get("event_type", "")
+            vid = evt.get("visitor_id", "")
+            ts_str = evt.get("timestamp", "")
+            if not ts_str:
+                continue
+            ts = _parse(ts_str)
+
+            if etype in ("BILLING_QUEUE_JOIN",):
+                open_billing[vid] = ts
+                queue_joins.append({"visitor_id": vid, "join_ts": ts})
+
+            elif etype in ("EXIT", "ZONE_EXIT") and vid in open_billing:
+                enter_ts = open_billing.pop(vid)
+                billing_intervals.append({
+                    "visitor_id": vid,
+                    "enter_ts": enter_ts,
+                    "exit_ts": ts,
+                })
+
+        # Close any still-open intervals (never exited)
+        for vid, enter_ts in open_billing.items():
+            billing_intervals.append({
+                "visitor_id": vid,
+                "enter_ts": enter_ts,
+                "exit_ts": None,
+            })
+
+        return {"billing_intervals": billing_intervals, "queue_joins": queue_joins}
+
+    def find_converted_sessions(self, billing_timeline: dict) -> set[str]:
+        """Visitors whose billing window overlaps the 5-min pre-transaction window."""
+        converted: set[str] = set()
+        intervals = billing_timeline.get("billing_intervals", [])
+
+        if self.transactions.empty:
+            return converted
+
+        for _, txn in self.transactions.iterrows():
+            txn_ts: datetime = txn["transaction_timestamp"]
+            window_start = txn_ts - self.correlation_window
+
+            for interval in intervals:
+                enter: datetime = interval["enter_ts"]
+                exit_ts: Optional[datetime] = interval["exit_ts"]
+
+                # Check overlap: billing window ∩ [window_start, txn_ts]
+                billing_end = exit_ts if exit_ts else txn_ts
+                if enter <= txn_ts and billing_end >= window_start:
+                    converted.add(interval["visitor_id"])
+
+        return converted
+
+    def find_abandoned_sessions(
+        self, billing_timeline: dict, converted_visitor_ids: set[str]
+    ) -> list[str]:
+        """Visitors who joined queue but didn't convert within abandon_window."""
+        abandoned: list[str] = []
+        intervals = billing_timeline.get("billing_intervals", [])
+
+        for interval in intervals:
+            vid = interval["visitor_id"]
+            if vid in converted_visitor_ids:
+                continue
+            exit_ts = interval.get("exit_ts")
+            if exit_ts is None:
+                continue  # never left — can't confirm abandonment
+            enter_ts = interval["enter_ts"]
+            if (exit_ts - enter_ts) <= self.abandon_window:
+                abandoned.append(vid)
+
+        return abandoned
+
+    def get_transaction_count(self) -> int:
+        return len(self.transactions)

@@ -1,123 +1,443 @@
 # You are building the main detection orchestration script for a retail store CCTV analytics pipeline.
 
 # FILE: pipeline/detect.py
-# PURPOSE: Entry-point script. Loads CCTV video clips, runs YOLOv8n person detection with
-# ByteTrack, coordinates all sub-modules (zone classifier, staff detector, Re-ID, queue tracker,
-# track manager, event emitter), and produces a complete structured event stream per clip.
-# Also runs POS correlation and emits BILLING_QUEUE_ABANDON events after all clips are processed.
 
-# TECH: Python 3.11, ultralytics==8.3.50, OpenCV (cv2), numpy==1.26.4, argparse, pathlib, tqdm
+import argparse
+import glob
+import json
+import logging
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-# KEY DESIGN DECISIONS:
-# - CPU-only: process every Nth frame (frame_skip, default 3) to maintain reasonable speed.
-# - Resize frames to 640×360 before YOLO inference; scale bounding boxes back to original.
-# - Use YOLO's built-in ByteTrack via model.track(tracker="bytetrack.yaml").
-# - Camera type assignment: match clip filenames against keyword lists in store_mapping.json.
-#   If no keyword match, assign clips in index order (0=entry, 1=floor, 2=billing).
-# - If fewer clips than cameras: skip missing cameras; log a warning.
-# - Clip start time: read from store_mapping.json camera config (clip_start_utc).
-#   Frame timestamp = clip_start_utc + timedelta(seconds=(frame_num * frame_skip / fps)).
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout,
+)
+log = logging.getLogger("detect")
 
-# IMPLEMENT THE FOLLOWING:
 
-# 1. `parse_args() -> argparse.Namespace:`
-#    Arguments: --clips-dir (str, required), --output-dir (str, default="data/events"),
-#    --api-url (str, default="http://localhost:8000"),
-#    --store-id (str, default="STORE_BLR_002"),
-#    --layout (str, default="data/store_layout.json"),
-#    --mapping (str, default="data/store_mapping.json"),
-#    --pos-data (str, default="data/pos_transactions.csv"),
-#    --no-api-post (store_true flag to disable API posting),
-#    --frame-skip (int, default=3),
-#    --confidence (float, default=0.35)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Store Intelligence CCTV Detection Pipeline")
+    parser.add_argument("--clips-dir", required=True, help="Directory containing CCTV clip files")
+    parser.add_argument("--output-dir", default="data/events", help="Output directory for JSONL events")
+    parser.add_argument("--api-url", default="http://localhost:8000", help="Store Intelligence API URL")
+    parser.add_argument("--store-id", default="STORE_BLR_002", help="Store ID to use in events")
+    parser.add_argument("--layout", default="data/store_layout.json", help="Path to store_layout.json")
+    parser.add_argument("--mapping", default="data/store_mapping.json", help="Path to store_mapping.json")
+    parser.add_argument("--pos-data", default="data/pos_transactions.csv", help="Path to POS CSV")
+    parser.add_argument("--no-api-post", action="store_true", help="Disable posting to API")
+    parser.add_argument("--frame-skip", type=int, default=3, help="Process every Nth frame")
+    parser.add_argument("--confidence", type=float, default=0.35, help="YOLO confidence threshold")
+    return parser.parse_args()
 
-# 2. `assign_clips_to_cameras(clips_dir: str, store_mapping: dict) -> dict[str, str]:`
-#    - Glob for *.mp4, *.avi, *.mov files in clips_dir.
-#    - For each camera in the store_mapping, try to match a clip by checking if any
-#      clip_filename_keyword appears in the clip filename (case-insensitive).
-#    - If no keyword match, fall back to clip_index ordering.
-#    - Returns dict: {camera_id: clip_path}. Logs assignments.
 
-# 3. `process_clip(clip_path: str, camera_id: str, store_id: str, clip_start_utc: str,
-#                   model, zone_classifier, staff_detector, reid_engine, queue_tracker,
-#                   track_manager, event_emitter, cfg) -> list[dict]:`
-#    - Opens clip with cv2.VideoCapture. Verify it opened; raise RuntimeError if not.
-#    - fps = cap.get(cv2.CAP_PROP_FPS). total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)).
-#    - Parse clip_start_utc with datetime.fromisoformat().replace(tzinfo=timezone.utc).
-#    - billing_zones = zone_classifier.get_billing_zones(camera_id).
-#    - Loop with tqdm progress bar (unit="frame"):
-#      a. Read frame; break on failure.
-#      b. Skip if frame_num % cfg.frame_skip != 0. Increment frame_num; continue.
-#      c. Calculate timestamp = clip_start_utc + timedelta(seconds=frame_num * cfg.frame_skip / fps).
-#      d. Resize frame: small = cv2.resize(frame, (cfg.inference_width, cfg.inference_height)).
-#      e. Run: results = model.track(small, classes=[0], persist=True,
-#                                    tracker="bytetrack.yaml", verbose=False,
-#                                    conf=cfg.confidence_threshold)
-#      f. If results is None or results[0].boxes is None: increment frame_num; continue.
-#      g. Parse results: extract boxes.xyxy.cpu().numpy(), boxes.id (track_ids, may be None),
-#         boxes.conf.cpu().numpy(). If track_ids is None, skip frame.
-#      h. Scale boxes from inference resolution back to original (multiply x by W/640, y by H/360).
-#      i. For each detection (bbox, track_id, conf):
-#         - foot_x, foot_y = get_foot_point(bbox)
-#         - zone_id = zone_classifier.classify_zone(camera_id, foot_x, foot_y)
-#         - is_staff, staff_conf = staff_detector.is_staff(frame, bbox, track_id)
-#         - reid_engine.update_track_embedding(track_id, frame, bbox, frame_num)
-#         - staff_detector.update_zone_history(track_id, zone_id)
-#         - Build detection dict for track_manager.
-#      j. result = track_manager.update(detections)
-#      k. Handle new_tracks: for each, attempt ReID match_reentry or match_cross_camera.
-#         - If reentry matched: emit REENTRY event (visitor_id = matched_id).
-#         - Elif cross-camera matched: use matched visitor_id, emit no ENTRY for this camera.
-#         - Else: generate new visitor_id via generate_visitor_id(); emit ENTRY event if
-#           check_entry_crossing returns "ENTRY" for entry cameras, or emit ENTRY for any
-#           new track on non-entry cameras (they entered via another zone).
-#      l. Handle lost_tracks: emit ZONE_EXIT (if in a zone), then EXIT. Call
-#         reid_engine.register_exit(). Call staff_detector.reset_track(). Call
-#         reid_engine.clear_track(). Call track_manager.remove_track().
-#      m. Handle zone_entries: emit ZONE_ENTER.
-#      n. Handle zone_exits: emit ZONE_EXIT (with dwell_ms computed from zone duration).
-#      o. Handle dwell_events: emit ZONE_DWELL.
-#      p. Update queue_tracker: active_billing = track_manager.get_active_billing_track_ids(billing_zones).
-#         queue_result = queue_tracker.update(active_billing, timestamp).
-#         For each track_id in queue_result["newly_joined"]: emit BILLING_QUEUE_JOIN with
-#         queue_depth = queue_result["depth"].
-#      q. For entry/exit cameras: check entry crossing using zone_classifier.check_entry_crossing().
-#         Compare with track's previous foot_y (store it in TrackState). Emit ENTRY or EXIT
-#         accordingly. Update track.has_entered.
-#    - After loop: call track_manager.clear_all() and emit EXIT for remaining active tracks.
-#    - cap.release(). Return list of all emitted events.
+def assign_clips_to_cameras(clips_dir: str, store_mapping: dict) -> dict[str, str]:
+    """Match clip files to camera IDs by keyword, falling back to index order."""
+    extensions = ["*.mp4", "*.avi", "*.mov", "*.MP4", "*.AVI", "*.MOV"]
+    all_clips: list[str] = []
+    for ext in extensions:
+        all_clips.extend(glob.glob(str(Path(clips_dir) / ext)))
+    all_clips = sorted(set(all_clips))
 
-# 4. `main() -> None:`
-#    - Parse args. Load store_layout.json and store_mapping.json (json.load).
-#    - Import cfg from pipeline.config.
-#    - Initialise all modules:
-#      zone_classifier = ZoneClassifier(args.layout)
-#      staff_detector = StaffDetector()
-#      reid_engine = ReIDEngine(cfg.reid_similarity_threshold)
-#      queue_tracker = QueueTracker(cfg.queue_spike_threshold)
-#      event_emitter = EventEmitter(store_id, output_path, api_url, post_to_api, batch_size)
-#    - Assign clips: clip_map = assign_clips_to_cameras(args.clips_dir, store_mapping).
-#    - For each camera_id, clip_path in clip_map.items():
-#      - Create a fresh TrackManager(camera_id=camera_id, ...) per clip.
-#      - Call process_clip(...).
-#    - After all clips: load all emitted events from JSONL, run POS correlation.
-#      correlator = POSCorrelator(args.pos_data, store_mapping)
-#      billing_timeline = correlator.build_billing_timeline(all_events)
-#      converted = correlator.find_converted_sessions(billing_timeline)
-#      abandoned = correlator.find_abandoned_sessions(billing_timeline, converted)
-#      For each abandoned visitor_id: emit BILLING_QUEUE_ABANDON event.
-#    - event_emitter.close(). Print summary stats.
+    cameras = []
+    for store in store_mapping.get("stores", []):
+        cameras = store.get("cameras", [])
+        break
 
-# IMPORTS NEEDED:
-#   argparse, json, pathlib (Path), glob, datetime (datetime, timedelta, timezone),
-#   cv2, numpy as np, tqdm (tqdm), ultralytics (YOLO),
-#   pipeline.config (cfg), pipeline.zone_classifier (ZoneClassifier, get_foot_point),
-#   pipeline.staff_detector (StaffDetector), pipeline.reid (ReIDEngine),
-#   pipeline.queue_tracker (QueueTracker), pipeline.event_emitter (EventEmitter, generate_visitor_id),
-#   pipeline.pos_correlator (POSCorrelator), pipeline.tracker (TrackManager)
+    clip_map: dict[str, str] = {}
 
-# if __name__ == "__main__": guard required.
+    for cam in cameras:
+        cam_id = cam["camera_id"]
+        keywords = [k.lower() for k in cam.get("clip_filename_keywords", [])]
+        matched = None
 
-# IMPORTANT: All print/log statements should go to stdout with timestamps.
-# Handle empty clips (0 detections) gracefully — do not crash; emit nothing.
-# Handle missing clips gracefully — log warning, skip camera.
+        for clip_path in all_clips:
+            fname = Path(clip_path).name.lower()
+            if any(kw in fname for kw in keywords):
+                matched = clip_path
+                break
+
+        if matched is None:
+            # Fall back to clip_index
+            idx = cam.get("clip_index", 0)
+            if idx < len(all_clips):
+                matched = all_clips[idx]
+
+        if matched:
+            clip_map[cam_id] = matched
+            log.info("Camera %s → %s", cam_id, matched)
+        else:
+            log.warning("No clip found for camera %s — skipping.", cam_id)
+
+    return clip_map
+
+
+def process_clip(
+    clip_path: str,
+    camera_id: str,
+    store_id: str,
+    clip_start_utc: str,
+    model,
+    zone_classifier,
+    staff_detector,
+    reid_engine,
+    queue_tracker,
+    track_manager,
+    event_emitter,
+    cfg,
+) -> list[dict]:
+    """Process a single CCTV clip and return all emitted events."""
+    try:
+        import cv2
+        import numpy as np
+        from tqdm import tqdm
+    except ImportError as exc:
+        log.error("Missing dependency: %s. Install requirements-pipeline.txt.", exc)
+        return []
+
+    cap = cv2.VideoCapture(clip_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video clip: {clip_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 15.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    try:
+        clip_start = datetime.fromisoformat(clip_start_utc.replace("Z", "+00:00"))
+    except Exception:
+        clip_start = datetime.now(timezone.utc)
+
+    billing_zones = zone_classifier.get_billing_zones(camera_id)
+    emitted_events: list[dict] = []
+    frame_num = 0
+
+    orig_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+    orig_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+    scale_x = orig_width / cfg.inference_width
+    scale_y = orig_height / cfg.inference_height
+
+    with tqdm(total=total_frames, unit="frame", desc=f"{camera_id}") as pbar:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_num % cfg.frame_skip != 0:
+                frame_num += 1
+                pbar.update(1)
+                continue
+
+            timestamp = clip_start + timedelta(seconds=frame_num / fps)
+
+            # Resize for inference
+            small = cv2.resize(frame, (cfg.inference_width, cfg.inference_height))
+
+            try:
+                results = model.track(
+                    small,
+                    classes=[0],
+                    persist=True,
+                    tracker="bytetrack.yaml",
+                    verbose=False,
+                    conf=cfg.confidence_threshold,
+                )
+            except Exception as exc:
+                log.debug("YOLO error on frame %d: %s", frame_num, exc)
+                frame_num += 1
+                pbar.update(1)
+                continue
+
+            if results is None or not results or results[0].boxes is None:
+                frame_num += 1
+                pbar.update(1)
+                continue
+
+            boxes_data = results[0].boxes
+            track_ids_tensor = boxes_data.id
+            if track_ids_tensor is None:
+                frame_num += 1
+                pbar.update(1)
+                continue
+
+            xyxy = boxes_data.xyxy.cpu().numpy()
+            track_ids = track_ids_tensor.cpu().numpy().astype(int)
+            confs = boxes_data.conf.cpu().numpy()
+
+            detections = []
+            for bbox, tid, conf in zip(xyxy, track_ids, confs):
+                # Scale back to original resolution
+                scaled_bbox = [
+                    bbox[0] * scale_x,
+                    bbox[1] * scale_y,
+                    bbox[2] * scale_x,
+                    bbox[3] * scale_y,
+                ]
+                from pipeline.zone_classifier import get_foot_point
+                foot_x, foot_y = get_foot_point(scaled_bbox)
+                zone_id = zone_classifier.classify_zone(camera_id, foot_x, foot_y)
+                is_staff, staff_conf = staff_detector.is_staff(frame, scaled_bbox, int(tid))
+                reid_engine.update_track_embedding(int(tid), frame, scaled_bbox, frame_num)
+                staff_detector.update_zone_history(int(tid), zone_id)
+
+                detections.append({
+                    "track_id": int(tid),
+                    "bbox_xyxy": scaled_bbox,
+                    "confidence": float(conf),
+                    "zone_id": zone_id,
+                    "is_staff": is_staff,
+                    "visitor_id": f"VIS_{tid:06X}",
+                    "foot_y": foot_y,
+                })
+
+            result = track_manager.update(detections)
+
+            # Handle new tracks
+            from pipeline.event_emittor import generate_visitor_id
+            for ts in result["new_tracks"]:
+                # Attempt ReID for re-entry
+                matched_vid = reid_engine.match_reentry(ts.track_id, timestamp)
+                if matched_vid:
+                    ts.visitor_id = matched_vid
+                    evt = event_emitter.emit(
+                        store_id=store_id, camera_id=camera_id,
+                        visitor_id=ts.visitor_id, event_type="REENTRY",
+                        timestamp=timestamp, is_staff=ts.is_staff,
+                        confidence=0.75,
+                    )
+                    emitted_events.append(evt)
+                    ts.has_entered = True
+                else:
+                    # Cross-camera dedup
+                    active_for_reid = {
+                        other_id: {
+                            "camera_id": other_ts.camera_id,
+                            "visitor_id": other_ts.visitor_id,
+                            "embedding": reid_engine.track_embeddings.get(other_id),
+                        }
+                        for other_id, other_ts in track_manager.get_all_active().items()
+                    }
+                    cross_vid = reid_engine.match_cross_camera(ts.track_id, active_for_reid, camera_id)
+                    if cross_vid:
+                        ts.visitor_id = cross_vid
+                    else:
+                        ts.visitor_id = generate_visitor_id()
+
+                    # Emit ENTRY for entry/billing camera or any new track on floor
+                    evt = event_emitter.emit(
+                        store_id=store_id, camera_id=camera_id,
+                        visitor_id=ts.visitor_id, event_type="ENTRY",
+                        timestamp=timestamp, is_staff=ts.is_staff,
+                        confidence=float(confs[0]) if len(confs) > 0 else 0.5,
+                    )
+                    emitted_events.append(evt)
+                    ts.has_entered = True
+
+            # Handle lost tracks
+            for ts in result["lost_tracks"]:
+                if ts.current_zone:
+                    evt = event_emitter.emit(
+                        store_id=store_id, camera_id=camera_id,
+                        visitor_id=ts.visitor_id, event_type="ZONE_EXIT",
+                        timestamp=timestamp, zone_id=ts.current_zone,
+                        is_staff=ts.is_staff, confidence=0.5,
+                    )
+                    emitted_events.append(evt)
+                evt = event_emitter.emit(
+                    store_id=store_id, camera_id=camera_id,
+                    visitor_id=ts.visitor_id, event_type="EXIT",
+                    timestamp=timestamp, is_staff=ts.is_staff, confidence=0.5,
+                )
+                emitted_events.append(evt)
+                reid_engine.register_exit(ts.visitor_id, ts.track_id, timestamp, camera_id)
+                staff_detector.reset_track(ts.track_id)
+                reid_engine.clear_track(ts.track_id)
+
+            # Zone entries
+            for ts, new_zone in result["zone_entries"]:
+                evt = event_emitter.emit(
+                    store_id=store_id, camera_id=camera_id,
+                    visitor_id=ts.visitor_id, event_type="ZONE_ENTER",
+                    timestamp=timestamp, zone_id=new_zone,
+                    is_staff=ts.is_staff, confidence=0.8,
+                )
+                emitted_events.append(evt)
+
+            # Zone exits with dwell
+            for ts, old_zone, dwell_ms in result["zone_exits"]:
+                evt = event_emitter.emit(
+                    store_id=store_id, camera_id=camera_id,
+                    visitor_id=ts.visitor_id, event_type="ZONE_EXIT",
+                    timestamp=timestamp, zone_id=old_zone, dwell_ms=dwell_ms,
+                    is_staff=ts.is_staff, confidence=0.8,
+                )
+                emitted_events.append(evt)
+
+            # Dwell events
+            for ts, zone_id, dwell_ms in result["dwell_events"]:
+                evt = event_emitter.emit(
+                    store_id=store_id, camera_id=camera_id,
+                    visitor_id=ts.visitor_id, event_type="ZONE_DWELL",
+                    timestamp=timestamp, zone_id=zone_id, dwell_ms=dwell_ms,
+                    is_staff=ts.is_staff, confidence=0.85,
+                )
+                emitted_events.append(evt)
+
+            # Queue tracker update
+            active_billing = track_manager.get_active_billing_track_ids(billing_zones)
+            queue_result = queue_tracker.update(active_billing, timestamp)
+            for tid in queue_result["newly_joined"]:
+                ts_q = track_manager.get_all_active().get(tid)
+                if ts_q:
+                    evt = event_emitter.emit(
+                        store_id=store_id, camera_id=camera_id,
+                        visitor_id=ts_q.visitor_id, event_type="BILLING_QUEUE_JOIN",
+                        timestamp=timestamp, zone_id=ts_q.current_zone,
+                        is_staff=ts_q.is_staff, confidence=0.9,
+                        queue_depth=queue_result["depth"],
+                    )
+                    emitted_events.append(evt)
+
+            frame_num += 1
+            pbar.update(1)
+
+    # Emit EXIT for remaining active tracks at clip end
+    for ts in track_manager.clear_all():
+        evt = event_emitter.emit(
+            store_id=store_id, camera_id=camera_id,
+            visitor_id=ts.visitor_id, event_type="EXIT",
+            timestamp=timestamp, is_staff=ts.is_staff, confidence=0.5,
+        )
+        emitted_events.append(evt)
+
+    cap.release()
+    log.info("[%s] Processed %d frames, emitted %d events.", camera_id, frame_num, len(emitted_events))
+    return emitted_events
+
+
+def main() -> None:
+    args = parse_args()
+
+    with open(args.layout, "r", encoding="utf-8") as f:
+        store_layout = json.load(f)
+    with open(args.mapping, "r", encoding="utf-8") as f:
+        store_mapping = json.load(f)
+
+    from pipeline.config import cfg as _cfg
+    from pipeline.zone_classifier import ZoneClassifier
+    from pipeline.staff_detector import StaffDetector
+    from pipeline.reid import ReIDEngine
+    from pipeline.queue_tracker import QueueTracker
+    from pipeline.event_emittor import EventEmitter, generate_visitor_id
+    from pipeline.pos_correlator import POSCorrelator
+    from pipeline.tracker import TrackManager
+
+    try:
+        from ultralytics import YOLO
+        model = YOLO(_cfg.yolo_model)
+        log.info("Loaded YOLO model: %s", _cfg.yolo_model)
+    except Exception as exc:
+        log.error("Could not load YOLO model: %s", exc)
+        sys.exit(1)
+
+    store_id = args.store_id
+    post_to_api = not args.no_api_post
+
+    output_path = Path(args.output_dir) / f"{store_id}_events.jsonl"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    zone_classifier = ZoneClassifier(args.layout)
+    staff_detector = StaffDetector()
+    reid_engine = ReIDEngine(_cfg.reid_similarity_threshold)
+    queue_tracker = QueueTracker(_cfg.queue_spike_threshold)
+    event_emitter = EventEmitter(
+        store_id=store_id,
+        output_path=str(output_path),
+        api_base_url=args.api_url,
+        post_to_api=post_to_api,
+        batch_size=_cfg.api_batch_size,
+    )
+
+    # Override frame_skip / confidence from args
+    import dataclasses
+    cfg_overrides = dataclasses.replace(
+        _cfg,
+        frame_skip=args.frame_skip,
+        confidence_threshold=args.confidence,
+    )
+
+    clip_map = assign_clips_to_cameras(args.clips_dir, store_mapping)
+    if not clip_map:
+        log.error("No clips could be assigned to cameras. Exiting.")
+        sys.exit(1)
+
+    all_events: list[dict] = []
+
+    for camera_id, clip_path in clip_map.items():
+        cam_start_utc = "2026-04-10T06:30:00Z"
+        for store in store_mapping.get("stores", []):
+            for cam in store.get("cameras", []):
+                if cam["camera_id"] == camera_id:
+                    cam_start_utc = cam.get("clip_start_utc", cam_start_utc)
+                    break
+
+        import cv2
+        cap = cv2.VideoCapture(clip_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 15.0
+        cap.release()
+
+        track_manager = TrackManager(
+            camera_id=camera_id,
+            store_id=store_id,
+            fps=fps,
+            dwell_threshold_seconds=cfg_overrides.dwell_threshold_seconds,
+        )
+
+        try:
+            events = process_clip(
+                clip_path=clip_path,
+                camera_id=camera_id,
+                store_id=store_id,
+                clip_start_utc=cam_start_utc,
+                model=model,
+                zone_classifier=zone_classifier,
+                staff_detector=staff_detector,
+                reid_engine=reid_engine,
+                queue_tracker=queue_tracker,
+                track_manager=track_manager,
+                event_emitter=event_emitter,
+                cfg=cfg_overrides,
+            )
+            all_events.extend(events)
+        except Exception as exc:
+            log.error("Error processing clip %s: %s", clip_path, exc, exc_info=True)
+
+    # POS correlation
+    correlator = POSCorrelator(args.pos_data, store_mapping, _cfg.pos_correlation_window_minutes)
+    billing_timeline = correlator.build_billing_timeline(all_events)
+    converted = correlator.find_converted_sessions(billing_timeline)
+    abandoned = correlator.find_abandoned_sessions(billing_timeline, converted)
+
+    log.info("POS: %d transactions, %d converted, %d abandoned", correlator.get_transaction_count(), len(converted), len(abandoned))
+
+    for visitor_id in abandoned:
+        evt = event_emitter.emit(
+            store_id=store_id,
+            camera_id="PIPELINE_CORRELATOR",
+            visitor_id=visitor_id,
+            event_type="BILLING_QUEUE_ABANDON",
+            timestamp=datetime.now(timezone.utc),
+            is_staff=False,
+            confidence=0.7,
+        )
+        all_events.append(evt)
+
+    event_emitter.close()
+    stats = event_emitter.get_stats()
+    log.info("Pipeline complete. Total events emitted: %d", stats["total_emitted"])
+    log.info("Events written to: %s", output_path)
+
+
+if __name__ == "__main__":
+    main()

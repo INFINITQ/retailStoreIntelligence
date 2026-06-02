@@ -1,79 +1,173 @@
-# You are building the Re-ID (re-identification) engine for a retail CCTV analytics pipeline.
+# You are building the Re-ID engine for a retail CCTV analytics pipeline.
 
 # FILE: pipeline/reid.py
-# PURPOSE: Extract lightweight appearance embeddings from person bounding-box crops using
-# MobileNetV3-Small (CPU-optimised). Match embeddings using cosine similarity to:
-# (a) detect re-entry of the same physical person after an EXIT event, and
-# (b) deduplicate the same person across overlapping cameras.
 
-# TECH: Python 3.11, torch (CPU), torchvision==0.20.1, numpy==1.26.4, scipy==1.14.1
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
-# CONTEXT:
-# - All faces are blurred; the model must rely entirely on clothing appearance and body shape.
-# - This runs on CPU — the model must be lightweight. Use MobileNetV3-Small pretrained on ImageNet.
-# - Embeddings are extracted from the penultimate layer (before the final classifier), giving a
-#   576-dim feature vector.
-# - Embeddings are cached per track_id and updated every 10 frames.
-# - Cosine similarity >= reid_similarity_threshold (default 0.65) = same person.
-# - Re-entry window: only compare against exits in the last 30 minutes.
-# - Cross-camera dedup window: only compare against active tracks from other cameras.
+import cv2
+import numpy as np
 
-# IMPLEMENT THE FOLLOWING:
+try:
+    import torch
+    import torchvision.models as tv_models
+    import torchvision.transforms as transforms
+    from scipy.spatial.distance import cosine as _cosine_dist
 
-# 1. Module-level:
-#    - Transform pipeline for pre-processing:
-#      `TRANSFORM = transforms.Compose([transforms.Resize((128, 64)), transforms.ToTensor(),
-#       transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])])`
+    TRANSFORM = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((128, 64)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
 
-# 2. `class ReIDEngine:`
 
-#    `__init__(self, similarity_threshold: float = 0.65):`
-#    - Load `torchvision.models.mobilenet_v3_small(weights="IMAGENET1K_V1")`.
-#    - Remove the final classifier layer: keep only the `features` + `avgpool` layers.
-#    - Set model to eval(), wrap in `torch.no_grad()` context.
-#    - `self.similarity_threshold = similarity_threshold`
-#    - `self.track_embeddings: dict[int, np.ndarray]` — cache per active track_id.
-#    - `self.exited_embeddings: dict[str, dict]` — maps visitor_id →
-#      {"embedding": np.ndarray, "exit_time": datetime, "camera_id": str}
+class ReIDEngine:
+    def __init__(self, similarity_threshold: float = 0.65) -> None:
+        self.similarity_threshold = similarity_threshold
+        self.track_embeddings: dict[int, np.ndarray] = {}
+        self.exited_embeddings: dict[str, dict] = {}
 
-#    `extract_embedding(self, frame_bgr: np.ndarray, bbox_xyxy: list[float]) -> np.ndarray | None:`
-#    - Crop bbox from frame_bgr; skip if crop area < 400 px².
-#    - Convert BGR→RGB, apply TRANSFORM, run through model.
-#    - L2-normalise the output vector. Return as 1-D numpy array.
-#    - Return None on any error.
+        self._model = None
+        if _TORCH_AVAILABLE:
+            try:
+                model = tv_models.mobilenet_v3_small(weights="IMAGENET1K_V1")
+                # Keep only features + avgpool (drop classifier)
+                model.classifier = torch.nn.Identity()
+                model.eval()
+                self._model = model
+            except Exception as exc:
+                print(f"[ReID] Model load failed: {exc}. Running without ReID.")
 
-#    `update_track_embedding(self, track_id: int, frame_bgr: np.ndarray,
-#                             bbox_xyxy: list[float], frame_num: int) -> None:`
-#    - Only run extraction if frame_num % 10 == 0 (update every 10 frames).
-#    - Store result in self.track_embeddings[track_id].
+    def extract_embedding(
+        self, frame_bgr: np.ndarray, bbox_xyxy: list
+    ) -> Optional[np.ndarray]:
+        if not _TORCH_AVAILABLE or self._model is None:
+            return None
+        try:
+            h, w = frame_bgr.shape[:2]
+            x1, y1, x2, y2 = (
+                int(max(0, bbox_xyxy[0])),
+                int(max(0, bbox_xyxy[1])),
+                int(min(w, bbox_xyxy[2])),
+                int(min(h, bbox_xyxy[3])),
+            )
+            if (x2 - x1) * (y2 - y1) < 400:
+                return None
+            crop = frame_bgr[y1:y2, x1:x2]
+            if crop.size == 0:
+                return None
+            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            tensor = TRANSFORM(rgb).unsqueeze(0)  # type: ignore[attr-defined]
+            with torch.no_grad():
+                feat = self._model(tensor).squeeze().numpy()
+            norm = np.linalg.norm(feat)
+            if norm == 0:
+                return None
+            return feat / norm
+        except Exception:
+            return None
 
-#    `cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:`
-#    - scipy.spatial.distance.cosine gives distance; return 1 - distance.
-#    - Return 0.0 if either vector is None or all-zero.
+    def update_track_embedding(
+        self, track_id: int, frame_bgr: np.ndarray, bbox_xyxy: list, frame_num: int
+    ) -> None:
+        if frame_num % 10 != 0:
+            return
+        emb = self.extract_embedding(frame_bgr, bbox_xyxy)
+        if emb is not None:
+            self.track_embeddings[track_id] = emb
 
-#    `match_reentry(self, track_id: int, current_time: datetime,
-#                    reentry_window_minutes: int = 30) -> str | None:`
-#    - Get embedding for track_id from self.track_embeddings (return None if not cached).
-#    - Compare against all entries in self.exited_embeddings where exit_time is within window.
-#    - Return visitor_id of the best match if similarity >= threshold, else None.
+        if len(self.track_embeddings) > 200:
+            print("[ReID] WARNING: track_embeddings > 200 entries — possible memory leak.")
 
-#    `match_cross_camera(self, track_id: int, active_tracks: dict,
-#                         own_camera_id: str) -> str | None:`
-#    - active_tracks: dict[track_id → {"camera_id": str, "visitor_id": str, "embedding": np.ndarray}]
-#    - Find active tracks from cameras other than own_camera_id.
-#    - Return visitor_id of best-matching active track if similarity >= threshold, else None.
+    def cosine_similarity(self, a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
+        if a is None or b is None:
+            return 0.0
+        if not a.any() or not b.any():
+            return 0.0
+        try:
+            if not _TORCH_AVAILABLE:
+                # Pure numpy fallback
+                dot = np.dot(a, b)
+                return float(dot / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
+            return float(1.0 - _cosine_dist(a, b))
+        except Exception:
+            return 0.0
 
-#    `register_exit(self, visitor_id: str, track_id: int, exit_time: datetime,
-#                    camera_id: str) -> None:`
-#    - Move embedding from track_embeddings to exited_embeddings.
-#    - Prune exited_embeddings entries older than 60 minutes.
+    def match_reentry(
+        self,
+        track_id: int,
+        current_time: datetime,
+        reentry_window_minutes: int = 30,
+    ) -> Optional[str]:
+        emb = self.track_embeddings.get(track_id)
+        if emb is None:
+            return None
 
-#    `clear_track(self, track_id: int) -> None:`
-#    - Remove track_id from self.track_embeddings.
+        cutoff = current_time - timedelta(minutes=reentry_window_minutes)
+        best_score = 0.0
+        best_vid: Optional[str] = None
 
-# IMPORTS NEEDED:
-#   torch, torchvision.models, torchvision.transforms as transforms,
-#   numpy as np, cv2, scipy.spatial.distance, datetime, typing (Optional)
+        for visitor_id, data in self.exited_embeddings.items():
+            exit_time = data["exit_time"]
+            if exit_time.tzinfo is None:
+                exit_time = exit_time.replace(tzinfo=timezone.utc)
+            if exit_time < cutoff:
+                continue
+            score = self.cosine_similarity(emb, data["embedding"])
+            if score >= self.similarity_threshold and score > best_score:
+                best_score = score
+                best_vid = visitor_id
 
-# ERROR HANDLING: All model inference in try/except; return None on failure.
-# Print a warning if track_embeddings grows beyond 200 entries (memory leak guard).
+        return best_vid
+
+    def match_cross_camera(
+        self,
+        track_id: int,
+        active_tracks: dict,
+        own_camera_id: str,
+    ) -> Optional[str]:
+        emb = self.track_embeddings.get(track_id)
+        if emb is None:
+            return None
+
+        best_score = 0.0
+        best_vid: Optional[str] = None
+
+        for other_tid, info in active_tracks.items():
+            if info.get("camera_id") == own_camera_id:
+                continue
+            other_emb = info.get("embedding")
+            score = self.cosine_similarity(emb, other_emb)
+            if score >= self.similarity_threshold and score > best_score:
+                best_score = score
+                best_vid = info.get("visitor_id")
+
+        return best_vid
+
+    def register_exit(
+        self, visitor_id: str, track_id: int, exit_time: datetime, camera_id: str
+    ) -> None:
+        emb = self.track_embeddings.pop(track_id, None)
+        if emb is not None:
+            self.exited_embeddings[visitor_id] = {
+                "embedding": emb,
+                "exit_time": exit_time,
+                "camera_id": camera_id,
+            }
+
+        # Prune entries older than 60 minutes
+        cutoff = exit_time - timedelta(minutes=60)
+        to_delete = [
+            vid
+            for vid, data in self.exited_embeddings.items()
+            if data["exit_time"] < cutoff
+        ]
+        for vid in to_delete:
+            del self.exited_embeddings[vid]
+
+    def clear_track(self, track_id: int) -> None:
+        self.track_embeddings.pop(track_id, None)

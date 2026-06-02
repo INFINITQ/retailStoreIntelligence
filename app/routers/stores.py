@@ -1,52 +1,98 @@
 # You are writing the stores router for a FastAPI retail analytics API.
 
 # FILE: app/routers/stores.py
-# PURPOSE: Defines four analytics endpoints for a given store:
-#   GET /stores/{store_id}/metrics
-#   GET /stores/{store_id}/funnel
-#   GET /stores/{store_id}/heatmap
-#   GET /stores/{store_id}/anomalies
-# Each delegates to the corresponding service module.
 
-# TECH: Python 3.11, fastapi, sqlalchemy.ext.asyncio
+import json
+from functools import lru_cache
 
-# IMPLEMENT:
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession
 
-# 1. `router = APIRouter(prefix="/stores", tags=["stores"])`
+from app.config import settings
+from app.database import get_db
+from app.models.schemas import AnomalyResponse, FunnelResponse, HeatmapResponse, MetricsResponse
+from app.services.anomalies import compute_anomalies
+from app.services.funnel import compute_funnel
+from app.services.heatmap import compute_heatmap
+from app.services.metrics import compute_metrics
 
-# 2. Common dependency `get_store_or_404`:
-#    - Accept store_id: str as path param.
-#    - Load known store IDs from store_layout.json (read file once, cache with lru_cache).
-#    - If store_id not in known stores: raise HTTPException(404, f"Store {store_id} not found").
+router = APIRouter(prefix="/stores", tags=["stores"])
 
-# 3. Optional query param `window_hours: int = Query(default=24, ge=1, le=168)`
-#    available on all endpoints (default: last 24 hours of data).
 
-# 4. `@router.get("/{store_id}/metrics", response_model=MetricsResponse)`
-#    `async def get_metrics(store_id: str, window_hours: int = Query(default=24),
-#                           db: AsyncSession = Depends(get_db)) -> MetricsResponse:`
-#    - Call: return await compute_metrics(db, store_id, window_hours)
-#    - Wrap DB errors in HTTPException(503).
+@lru_cache(maxsize=1)
+def _load_known_store_ids() -> set[str]:
+    try:
+        with open(settings.store_layout_path, "r", encoding="utf-8") as f:
+            layout = json.load(f)
+        store_id = layout.get("store_id")
+        if store_id:
+            return {store_id}
+    except Exception:
+        pass
 
-# 5. `@router.get("/{store_id}/funnel", response_model=FunnelResponse)`
-#    `async def get_funnel(store_id: str, window_hours: int = Query(default=24),
-#                          db: AsyncSession = Depends(get_db)) -> FunnelResponse:`
-#    - Call: return await compute_funnel(db, store_id, window_hours)
+    # Fallback: read from store_mapping.json
+    try:
+        with open(settings.store_mapping_path, "r", encoding="utf-8") as f:
+            mapping = json.load(f)
+        return {s["api_store_id"] for s in mapping.get("stores", [])}
+    except Exception:
+        return set()
 
-# 6. `@router.get("/{store_id}/heatmap", response_model=HeatmapResponse)`
-#    `async def get_heatmap(store_id: str, window_hours: int = Query(default=24),
-#                           db: AsyncSession = Depends(get_db)) -> HeatmapResponse:`
-#    - Call: return await compute_heatmap(db, store_id, window_hours)
 
-# 7. `@router.get("/{store_id}/anomalies", response_model=AnomalyResponse)`
-#    `async def get_anomalies(store_id: str,
-#                             db: AsyncSession = Depends(get_db)) -> AnomalyResponse:`
-#    - Call: return await compute_anomalies(db, store_id)
+def _get_store_or_404(store_id: str) -> str:
+    known = _load_known_store_ids()
+    if store_id not in known:
+        raise HTTPException(status_code=404, detail=f"Store {store_id} not found")
+    return store_id
 
-# IMPORTS NEEDED:
-#   fastapi (APIRouter, HTTPException, Depends, Query), sqlalchemy.ext.asyncio (AsyncSession),
-#   functools (lru_cache), json, app.database (get_db),
-#   app.models.schemas (MetricsResponse, FunnelResponse, HeatmapResponse, AnomalyResponse),
-#   app.services.metrics (compute_metrics), app.services.funnel (compute_funnel),
-#   app.services.heatmap (compute_heatmap), app.services.anomalies (compute_anomalies),
-#   app.config (settings)
+
+@router.get("/{store_id}/metrics", response_model=MetricsResponse)
+async def get_metrics(
+    store_id: str,
+    window_hours: int = Query(default=24, ge=1, le=168),
+    db: AsyncSession = Depends(get_db),
+) -> MetricsResponse:
+    _get_store_or_404(store_id)
+    try:
+        return await compute_metrics(db, store_id, window_hours)
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "Database unavailable"})
+
+
+@router.get("/{store_id}/funnel", response_model=FunnelResponse)
+async def get_funnel(
+    store_id: str,
+    window_hours: int = Query(default=24, ge=1, le=168),
+    db: AsyncSession = Depends(get_db),
+) -> FunnelResponse:
+    _get_store_or_404(store_id)
+    try:
+        return await compute_funnel(db, store_id, window_hours)
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "Database unavailable"})
+
+
+@router.get("/{store_id}/heatmap", response_model=HeatmapResponse)
+async def get_heatmap(
+    store_id: str,
+    window_hours: int = Query(default=24, ge=1, le=168),
+    db: AsyncSession = Depends(get_db),
+) -> HeatmapResponse:
+    _get_store_or_404(store_id)
+    try:
+        return await compute_heatmap(db, store_id, window_hours)
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "Database unavailable"})
+
+
+@router.get("/{store_id}/anomalies", response_model=AnomalyResponse)
+async def get_anomalies(
+    store_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> AnomalyResponse:
+    _get_store_or_404(store_id)
+    try:
+        return await compute_anomalies(db, store_id)
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "Database unavailable"})
