@@ -1,1 +1,13 @@
 .venv
+.env
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.DS_Store
+.coverage
+cctv
+events
+yolov8n.pt
+test_asyncpg.py
+debug_settings.py

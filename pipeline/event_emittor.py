@@ -7,9 +7,9 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-
+from typing import Literal
 import httpx
-from pydantic import BaseModel, Literal, field_validator
+from pydantic import BaseModel, field_validator
 
 
 def generate_visitor_id() -> str:
