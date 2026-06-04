@@ -374,12 +374,18 @@ def main() -> None:
 
     all_events: list[dict] = []
 
+    # Use the current UTC time as clip start so events fall within the
+    # dashboard / API "recent window" filters.  The store_mapping's
+    # clip_start_utc is only a fallback.
+    live_start_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     for camera_id, clip_path in clip_map.items():
-        cam_start_utc = "2026-04-10T06:30:00Z"
+        cam_start_utc = live_start_utc
         for store in store_mapping.get("stores", []):
             for cam in store.get("cameras", []):
                 if cam["camera_id"] == camera_id:
-                    cam_start_utc = cam.get("clip_start_utc", cam_start_utc)
+                    # Prefer live_start_utc so events are always "current"
+                    cam_start_utc = live_start_utc
                     break
 
         import cv2

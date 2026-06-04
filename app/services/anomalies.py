@@ -22,10 +22,11 @@ def _now_iso() -> str:
 
 
 async def _check_queue_spike(
-    db: AsyncSession, store_id: str, cfg
+    db: AsyncSession, store_id: str, cfg, ref_now: Optional[datetime] = None
 ) -> Optional[Anomaly]:
     """Check for billing queue spike in the last 30 minutes."""
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
+    _now = ref_now or datetime.now(timezone.utc)
+    cutoff = _now - timedelta(minutes=30)
     result = await db.execute(
         select(Event.metadata_json, Event.timestamp)
         .where(
@@ -64,10 +65,10 @@ async def _check_queue_spike(
 
 
 async def _check_conversion_drop(
-    db: AsyncSession, store_id: str, cfg
+    db: AsyncSession, store_id: str, cfg, ref_now: Optional[datetime] = None
 ) -> Optional[Anomaly]:
     """Compare today's conversion rate with the 7-day rolling average."""
-    now = datetime.now(timezone.utc)
+    now = ref_now or datetime.now(timezone.utc)
     today_start = now - timedelta(hours=24)
 
     # Today's rate
@@ -151,16 +152,17 @@ async def _check_conversion_drop(
 
 
 async def _check_dead_zones(
-    db: AsyncSession, store_id: str, cfg
+    db: AsyncSession, store_id: str, cfg, ref_now: Optional[datetime] = None
 ) -> list[Anomaly]:
     """Check each product zone for inactivity > dead_zone_minutes."""
+    _now = ref_now or datetime.now(timezone.utc)
     try:
         with open(cfg.store_layout_path, "r", encoding="utf-8") as f:
             layout = json.load(f)
     except Exception:
         return []
 
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=cfg.dead_zone_minutes)
+    cutoff = _now - timedelta(minutes=cfg.dead_zone_minutes)
     anomalies: list[Anomaly] = []
     billing_ids = {"BILLING", "BILLING_QUEUE"}
 
@@ -187,8 +189,9 @@ async def _check_dead_zones(
         if not is_dead:
             continue
 
+
         if last_ts is not None:
-            minutes_since = (datetime.now(timezone.utc) - last_ts).total_seconds() / 60
+            minutes_since = (_now - last_ts).total_seconds() / 60
         else:
             minutes_since = float("inf")
 
@@ -211,7 +214,7 @@ async def _check_dead_zones(
 
 
 async def _check_stale_feed(
-    db: AsyncSession, store_id: str, cfg
+    db: AsyncSession, store_id: str, cfg, ref_now: Optional[datetime] = None
 ) -> Optional[Anomaly]:
     """Emit STALE_FEED if last event is > stale_feed_minutes ago."""
     result = await db.execute(
@@ -230,8 +233,9 @@ async def _check_stale_feed(
             details={"minutes_since_last_event": None},
         )
 
+    _now = ref_now or datetime.now(timezone.utc)
     last_ts_aware = last_ts.replace(tzinfo=timezone.utc) if last_ts.tzinfo is None else last_ts
-    minutes_since = (datetime.now(timezone.utc) - last_ts_aware).total_seconds() / 60
+    minutes_since = (_now - last_ts_aware).total_seconds() / 60
 
     if minutes_since < cfg.stale_feed_minutes:
         return None
@@ -251,18 +255,34 @@ async def compute_anomalies(db: AsyncSession, store_id: str) -> AnomalyResponse:
     cfg = settings
     anomalies: list[Anomaly] = []
 
-    queue_anomaly = await _check_queue_spike(db, store_id, cfg)
+    # Determine a reference time for anomaly checks.  If all events are
+    # historical (outside a recent 24h window), use the latest event
+    # timestamp so the checks still produce meaningful results.
+    from app.models.db_models import Event as _Evt
+    ref_now = datetime.now(timezone.utc)
+    range_result = await db.execute(
+        select(func.max(_Evt.timestamp)).where(_Evt.store_id == store_id)
+    )
+    latest_ts = range_result.scalar_one_or_none()
+    if latest_ts is not None:
+        if latest_ts.tzinfo is None:
+            latest_ts = latest_ts.replace(tzinfo=timezone.utc)
+        # If the newest event is more than 24 h old, shift reference time
+        if (ref_now - latest_ts).total_seconds() > 86400:
+            ref_now = latest_ts
+
+    queue_anomaly = await _check_queue_spike(db, store_id, cfg, ref_now)
     if queue_anomaly:
         anomalies.append(queue_anomaly)
 
-    conv_anomaly = await _check_conversion_drop(db, store_id, cfg)
+    conv_anomaly = await _check_conversion_drop(db, store_id, cfg, ref_now)
     if conv_anomaly:
         anomalies.append(conv_anomaly)
 
-    dead_zones = await _check_dead_zones(db, store_id, cfg)
+    dead_zones = await _check_dead_zones(db, store_id, cfg, ref_now)
     anomalies.extend(dead_zones)
 
-    stale = await _check_stale_feed(db, store_id, cfg)
+    stale = await _check_stale_feed(db, store_id, cfg, ref_now)
     if stale:
         anomalies.append(stale)
 

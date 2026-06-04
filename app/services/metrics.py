@@ -30,6 +30,31 @@ async def compute_metrics(
     now = datetime.now(timezone.utc)
     window_start = now - timedelta(hours=window_hours)
 
+    # Auto-adjust window: if no events fall in the live window, expand to
+    # cover the actual event range so historical data is always visible.
+    from sqlalchemy import exists as sa_exists
+    has_events = await db.execute(
+        select(func.count(Event.id)).where(
+            and_(
+                Event.store_id == store_id,
+                Event.timestamp >= window_start,
+                Event.timestamp <= now,
+            )
+        )
+    )
+    if (has_events.scalar_one() or 0) == 0:
+        range_result = await db.execute(
+            select(func.min(Event.timestamp), func.max(Event.timestamp)).where(
+                Event.store_id == store_id
+            )
+        )
+        range_row = range_result.first()
+        if range_row and range_row[0] is not None:
+            now = range_row[1]
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=timezone.utc)
+            window_start = now - timedelta(hours=window_hours)
+
     # 1. UNIQUE VISITORS
     uv_result = await db.execute(
         select(func.count(distinct(VisitorSession.visitor_id))).where(

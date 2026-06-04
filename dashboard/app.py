@@ -58,6 +58,25 @@ def _event_window(events: list[dict], window_hours: int) -> list[dict]:
             continue
         if ts.timestamp() >= cutoff:
             filtered.append(event)
+
+    # If the live window returned nothing but events exist, auto-adjust:
+    # use the latest event timestamp as the reference point so historical
+    # data is always visible on the dashboard.
+    if not filtered and events:
+        latest_ts = None
+        for event in events:
+            ts = _parse_timestamp(str(event.get("timestamp", "")))
+            if ts is not None and (latest_ts is None or ts > latest_ts):
+                latest_ts = ts
+        if latest_ts is not None:
+            hist_cutoff = latest_ts.timestamp() - (window_hours * 3600)
+            for event in events:
+                ts = _parse_timestamp(str(event.get("timestamp", "")))
+                if ts is None:
+                    continue
+                if ts.timestamp() >= hist_cutoff:
+                    filtered.append(event)
+
     return filtered
 
 
