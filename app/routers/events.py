@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models.schemas import IngestRequest, IngestResponse
-from app.services.ingestion import ingest_event_batch
+from app.services import ingestion as ingestion_service
 
 router = APIRouter(prefix="/events", tags=["events"])
 
@@ -23,7 +23,7 @@ async def ingest_events(
         raise HTTPException(status_code=400, detail="Batch exceeds 500 events")
 
     try:
-        result = await ingest_event_batch(db, payload.events)
+        result = await ingestion_service.ingest_event_batch(db, payload.events)
     except OperationalError:
         raise HTTPException(
             status_code=503,

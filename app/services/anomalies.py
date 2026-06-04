@@ -180,12 +180,15 @@ async def _check_dead_zones(
         )
         last_ts = last_activity.scalar_one_or_none()
 
+        if last_ts is not None and last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=timezone.utc)
+
         is_dead = (last_ts is None) or (last_ts < cutoff)
         if not is_dead:
             continue
 
         if last_ts is not None:
-            minutes_since = (datetime.now(timezone.utc) - last_ts.replace(tzinfo=timezone.utc)).total_seconds() / 60
+            minutes_since = (datetime.now(timezone.utc) - last_ts).total_seconds() / 60
         else:
             minutes_since = float("inf")
 

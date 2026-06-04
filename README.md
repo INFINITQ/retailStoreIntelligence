@@ -52,23 +52,9 @@ If you ever change the Postgres credentials, make sure the API, Docker Compose, 
 .\.venv\Scripts\Activate.ps1
 ```
 
-If PowerShell blocks script execution, allow it for the current process only:
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
-.\.venv\Scripts\Activate.ps1
-```
-
 ### 2. Start Postgres and Redis
 
 ```powershell
-docker compose up -d postgres redis
-```
-
-If you see a password authentication error on startup, the most common cause is a previously created Postgres volume with a different password. Recreate it with:
-
-```powershell
-docker compose down -v
 docker compose up -d postgres redis
 ```
 
@@ -181,13 +167,13 @@ If the 5 recordings are multiple segments from the same three cameras, you can u
 First, verify event generation without posting to the API:
 
 ```powershell
-python pipeline\detect.py --clips-dir "D:\CCTV\store-001" --output-dir data\events --api-url http://127.0.0.1:8000 --no-api-post
+python -m pipeline.detect --clips-dir "D:\CCTV\store-001" --output-dir data\events --api-url http://127.0.0.1:8000 --no-api-post
 ```
 
 Then run it with API posting enabled:
 
 ```powershell
-python pipeline\detect.py --clips-dir "D:\CCTV\store-001" --output-dir data\events --api-url http://127.0.0.1:8000
+python -m pipeline.detect --clips-dir "D:\CCTV\store-001" --output-dir data\events --api-url http://127.0.0.1:8000
 ```
 
 The pipeline writes a JSONL file named:
@@ -208,37 +194,3 @@ That file is the easiest place to inspect whether detections, queue events, zone
 6. Re-run the pipeline with API posting enabled.
 7. Open the dashboard and confirm metrics and anomalies update.
 8. Run `pytest` to verify the codebase behavior.
-
-## Troubleshooting
-
-### `password authentication failed for user "store_user"`
-
-This usually means one of two things:
-
-- your `.env` and Compose defaults do not match
-- the Postgres volume was created earlier with a different password and needs to be recreated
-
-Use:
-
-```powershell
-docker compose down -v
-docker compose up -d postgres redis
-```
-
-### API starts but health is degraded
-
-Check that Redis is running and that the database URL in `.env` points to the correct host and port.
-
-### Pipeline cannot open videos
-
-Make sure the clips are readable on disk and that OpenCV can open the container format. MP4 is the safest choice.
-
-### Dashboard shows no data
-
-Confirm the pipeline successfully posted events to the API, and check that the API health endpoint is healthy.
-
-## Notes
-
-- `pipeline/run.sh` is a Bash script and is most convenient in Git Bash or WSL. On Windows PowerShell, run `pipeline\detect.py` directly as shown above.
-- The API creates tables on startup through SQLAlchemy, and Alembic migrations are available for database schema management.
-- Prometheus metrics are mounted at `/metrics`.
